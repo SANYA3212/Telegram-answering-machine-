@@ -315,7 +315,7 @@ async def transcribe_audio(media_buffer):
         dg_client = DeepgramClient(api_key)
 
         media_buffer.seek(0)
-        payload: FileSource = {"buffer": media_buffer}
+        payload: FileSource = {"buffer": media_buffer.read()}
         options = PrerecordedOptions(model="nova-2-general", language="ru", smart_format=True)
 
         response = await dg_client.listen.rest.v("1").transcribe_file(payload, options)
