@@ -13,9 +13,11 @@ import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 from collections import deque
 import sys  # <<<<< добавлено
+from pydub import AudioSegment
 
 import httpx
 from telethon import TelegramClient, events
+from deepgram import DeepgramClient, PrerecordedOptions, FileSource
 
 # ===================== Папки/файлы =====================
 # onefile-режим PyInstaller: писать рядом с .exe
@@ -31,9 +33,25 @@ CHATS_DIR   = os.path.join(BASE_DIR, "Chats")
 API_FILE    = os.path.join(BASE_DIR, "api_text_model.json")
 TG_FILE     = os.path.join(BASE_DIR, "telegram_api.json")
 PROMPT_FILE = os.path.join(BASE_DIR, "SYSTEM_PROMPT.json")
+DEEPGRAM_FILE = os.path.join(BASE_DIR, "deepgram_api.json")
 os.makedirs(CHATS_DIR, exist_ok=True)
 
 # ===================== Конфиги API/Telegram =====================
+def ensure_deepgram_config():
+    if os.path.exists(DEEPGRAM_FILE):
+        return
+    with open(DEEPGRAM_FILE, "w", encoding="utf-8") as f:
+        json.dump({"api_key": ""}, f, ensure_ascii=False, indent=2)
+
+def load_deepgram_config():
+    ensure_deepgram_config()
+    with open(DEEPGRAM_FILE, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    api_key = (cfg.get("api_key") or "").strip()
+    if not api_key:
+        raise RuntimeError("В deepgram_api.json пустой api_key.")
+    return api_key
+
 def ensure_api_config():
     if os.path.exists(API_FILE):
         return
@@ -175,6 +193,11 @@ temp_value_label = None
 
 chat_entities = []
 filtered_chats = []
+active_chats_listbox = None
+active_chat_entities = {}
+active_chat_id_map = {}
+custom_prompt_text = None
+gui_message_text = None
 
 # ===================== Rate limit (RPM) =====================
 _rate_lock = asyncio.Lock()
@@ -203,25 +226,34 @@ def _history_path(chat_title: str) -> str:
 
 def load_history(chat_title: str, friend_name: str):
     p = _history_path(chat_title)
+    custom_prompt = ""
+    history = []
+
     if os.path.exists(p):
         try:
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, list):
-                return data, p
+            if isinstance(data, dict):
+                history = data.get("history", [])
+                custom_prompt = data.get("custom_prompt", "")
+                return history, custom_prompt, p
         except Exception:
             pass
-    hist = [
+
+    # If file is old format (list) or doesn't exist, create a new structure
+    history = [
         {"role": "system", "content": SYSTEM_PROMPT_TXT},
         {"role": "system", "content": f"Сейчас ты общаешься с: {friend_name}."}
     ]
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(hist, f, ensure_ascii=False, indent=2)
-    return hist, p
+    save_history(p, history, custom_prompt)
+    return history, custom_prompt, p
 
-def save_history(path: str, history):
+def save_history(path: str, history, custom_prompt: str):
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {"custom_prompt": custom_prompt, "history": history},
+            f, ensure_ascii=False, indent=2
+        )
 
 def clear_log():
     if not log_text: return
@@ -273,11 +305,40 @@ def _history_to_gemini_contents(history):
         contents.append({"role": role_map, "parts": parts})
     return contents
 
-async def gemini_generate(history, friend_name: str, temperature: float):
+async def transcribe_audio(media_buffer):
+    """
+    Converts an audio buffer from ogg to mp3 and transcribes it using Deepgram.
+    """
+    try:
+        api_key = load_deepgram_config()
+        dg_client = DeepgramClient(api_key)
+
+        media_buffer.seek(0)
+        audio = AudioSegment.from_file(media_buffer, format="ogg")
+
+        mp3_buffer = io.BytesIO()
+        audio.export(mp3_buffer, format="mp3")
+        mp3_buffer.seek(0)
+
+        payload: FileSource = {"buffer": mp3_buffer, "mimetype": "audio/mpeg"}
+        options = PrerecordedOptions(model="nova-2-general", language="ru", smart_format=True)
+
+        response = await dg_client.listen.prerecorded.v("1").transcribe_file(payload, options)
+        transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
+        return transcript
+
+    except Exception as e:
+        append_log_sync(f"[Deepgram Error] {e}", "red")
+        return None
+
+async def gemini_generate(history, friend_name: str, temperature: float, custom_prompt: str):
     endpoint, model, rpm = load_api_config()
-    sys_text = f"{SYSTEM_PROMPT_TXT}\nСейчас ты общаешься с: {friend_name}."
+
+    # Combine main, custom, and friend prompts
+    full_system_prompt = f"{SYSTEM_PROMPT_TXT}\n\n{custom_prompt}\n\nСейчас ты общаешься с: {friend_name}."
+
     payload = {
-        "systemInstruction": {"role": "system", "parts": [{"text": sys_text}]},
+        "systemInstruction": {"role": "system", "parts": [{"text": full_system_prompt}]},
         "contents": _history_to_gemini_contents(history),
         "generationConfig": {"temperature": float(temperature), "topP": 0.95, "maxOutputTokens": 1024}
     }
@@ -337,8 +398,87 @@ async def get_dialogs():
         append_log_sync(f"[Dialogs Error] {e}", "red")
         return []
 
-async def start_bot(chat_entity, friend_name, chat_title):
-    global handler_ref, bot_running
+async def multi_chat_handler(evt):
+    if not bot_running: return
+
+    cli = await ensure_client()
+    me = await cli.get_me()
+
+    if not see_my_msgs_var.get():
+        if getattr(evt.message, "out", False): return
+        if getattr(evt.message, "sender_id", None) == me.id: return
+
+    chat_id = evt.chat_id
+    # Find chat title and friend name from our active chats
+    chat_title = active_chat_id_map.get(chat_id)
+    if not chat_title: return # Not a chat we are monitoring
+
+    # This part is a bit tricky. We need to get the "friend" context.
+    # For now, let's use the default "Noname" for all.
+    # A better implementation would store this per-chat.
+    friend_name = NONAME[0]
+
+    history, custom_prompt, hist_path = load_history(chat_title, friend_name)
+    append_log_sync(f"-> Msg in [{chat_title}]", "green")
+
+    entry = None
+    is_voice = evt.message.voice
+
+    if is_voice:
+        append_log_sync(f"  [User] <голосовое сообщение>", "white")
+        buf = io.BytesIO()
+        await cli.download_media(evt.message, buf)
+        transcribed_text = await transcribe_audio(buf)
+        buf.close()
+        if transcribed_text:
+            append_log_sync(f"  [Transcription] {transcribed_text}", "green")
+            entry = transcribed_text
+        else:
+            append_log_sync(f"  [Transcription] Не удалось распознать речь.", "red")
+
+    elif evt.media:
+        append_log_sync(f"  [User] <media>", "white")
+        buf = io.BytesIO()
+        await cli.download_media(evt.media, buf)
+        buf.seek(0)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        buf.close()
+        entry = f"DATA:image/png;base64,{b64}"
+
+    else:
+        text = (evt.raw_text or "").strip()
+        append_log_sync(f"  [User] {text}", "white")
+        if text:
+            entry = text
+
+    if not entry:
+        return
+
+    history.append({"role": "user", "content": entry})
+    save_history(hist_path, history, custom_prompt)
+
+    async with SEM:
+        try:
+            reply = await gemini_generate(history, friend_name=friend_name, temperature=float(temp_var.get()), custom_prompt=custom_prompt)
+        except httpx.HTTPStatusError as he:
+            append_log_sync(f"  [Gemini HTTP] {he}", "red"); return
+        except Exception as e:
+            append_log_sync(f"  [Gemini Error] {e}", "red"); return
+
+    if reply:
+        append_log_sync(f"  [Sanya] {reply}", "violet")
+        history.append({"role": "assistant", "content": reply})
+        save_history(hist_path, history, custom_prompt)
+        if bot_running:
+            await cli.send_message(chat_id, reply)
+
+async def start_listeners():
+    global handler_ref, bot_running, active_chat_id_map
+
+    if not active_chat_entities:
+        messagebox.showwarning("Ошибка", "Нет активных чатов для запуска.")
+        return
+
     try:
         endpoint, model, rpm = load_api_config()
     except Exception as e:
@@ -346,64 +486,22 @@ async def start_bot(chat_entity, friend_name, chat_title):
 
     cli = await ensure_client()
     me = await cli.get_me()
-    my_id = me.id
+
+    # Create a map of chat_id -> chat_title for the handler
+    active_chat_id_map = {entity.id: name for name, entity in active_chat_entities.items()}
+
+    entities = list(active_chat_entities.values())
+
+    handler_ref = multi_chat_handler
+    cli.add_event_handler(handler_ref, events.NewMessage(chats=entities))
+
     bot_running = True
-
-    history, hist_path = load_history(chat_title, friend_name)
-
     clear_log()
-    append_log_sync(f"✅ Подключено как {me.first_name} (id={my_id})", "violet")
+    append_log_sync(f"✅ Подключено как {me.first_name} (id={me.id})", "violet")
     append_log_sync(f"🤖 Провайдер: gemini | Модель: {model}", "green")
-    append_log_sync(f"🔗 Endpoint: {endpoint}", "green")
-    append_log_sync(f"📁 История: {os.path.basename(hist_path)}", "green")
-    render_history_to_log(history)
+    append_log_sync(f"🚀 Мост запущен для {len(entities)} чатов. Жду сообщения.", "green")
 
-    async def handler(evt):
-        if not bot_running:
-            return
-        if not see_my_msgs_var.get():
-            if getattr(evt.message, "out", False):
-                return
-            if getattr(evt.message, "sender_id", None) == my_id:
-                return
-
-        text = (evt.raw_text or "").strip()
-        media = evt.media
-        append_log_sync(f"[User] {'<media>' if media else text}", "white")
-
-        if media:
-            buf = io.BytesIO()
-            await cli.download_media(media, buf)
-            buf.seek(0)
-            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-            buf.close()
-            entry = f"DATA:image/png;base64,{b64}"
-        else:
-            entry = text
-
-        history.append({"role": "user", "content": entry})
-        save_history(hist_path, history)
-
-        async with SEM:
-            try:
-                reply = await gemini_generate(history, friend_name=friend_name, temperature=float(temp_var.get()))
-            except httpx.HTTPStatusError as he:
-                append_log_sync(f"[Gemini HTTP] {he}", "red"); return
-            except Exception as e:
-                append_log_sync(f"[Gemini Error] {e}", "red"); return
-
-        if reply:
-            append_log_sync(f"[Sanya] {reply}", "violet")
-            history.append({"role": "assistant", "content": reply})
-            save_history(hist_path, history)
-            if bot_running:
-                await cli.send_message(chat_entity, reply)
-
-    handler_ref = handler
-    cli.add_event_handler(handler_ref, events.NewMessage(chats=chat_entity))
-    append_log_sync("🚀 Мост запущен — жду сообщения.", "green")
-
-async def stop_bot():
+async def stop_listeners():
     global handler_ref, bot_running
     bot_running = False
     if client and handler_ref:
@@ -445,35 +543,138 @@ def on_search(*_):
         chat_listbox.insert('end', f"{i}. {name}")
 
 def _selected_chat_title():
-    sel = chat_listbox.curselection()
+    # Now returns the selected item from the *active* list
+    sel = active_chats_listbox.curselection()
     if not sel: return None
-    return filtered_chats[sel[0]][0]
+    return active_chats_listbox.get(sel[0])
 
 def on_start():
     if bot_running:
         messagebox.showinfo("Info", "Бот уже запущен."); return
-    title = _selected_chat_title()
-    if not title:
-        messagebox.showwarning("Ошибка", "Выбери чат."); return
-    entity = filtered_chats[chat_listbox.curselection()[0]][1]
-    idx = friend_combo.current()
-    friend_name = FRIENDS[idx][0] if idx < len(FRIENDS) else NONAME[0]
-    run_async(start_bot(entity, friend_name, title))
+
+    if not active_chat_entities:
+        messagebox.showwarning("Ошибка", "Добавьте хотя бы один чат в список активных."); return
+
+    run_async(start_listeners())
     set_buttons(True)
 
 def on_stop():
-    run_async(stop_bot()); set_buttons(False)
+    run_async(stop_listeners()); set_buttons(False)
 
 def on_restart():
-    run_async(stop_bot())
+    run_async(stop_listeners())
     refresh_dialogs_from_async(clear_selection=True)
     chat_listbox.selection_clear(0, 'end')
     set_buttons(False)
 
+def on_add_chat():
+    selected_indices = chat_listbox.curselection()
+    if not selected_indices:
+        return
+
+    current_active_chats = active_chats_listbox.get(0, "end")
+
+    for i in selected_indices:
+        chat_name, chat_entity = filtered_chats[i]
+
+        # Store entity in a global dict for later access
+        active_chat_entities[chat_name] = chat_entity
+
+        if chat_name not in current_active_chats:
+            active_chats_listbox.insert("end", chat_name)
+
+def on_remove_chat():
+    selected_indices = active_chats_listbox.curselection()
+    if not selected_indices:
+        return
+
+    # Iterate backwards to avoid index shifting issues
+    for i in sorted(selected_indices, reverse=True):
+        chat_name = active_chats_listbox.get(i)
+        active_chats_listbox.delete(i)
+        if chat_name in active_chat_entities:
+            del active_chat_entities[chat_name]
+
+def on_active_chat_select(_=None):
+    sel = active_chats_listbox.curselection()
+    if not sel: return
+    chat_title = active_chats_listbox.get(sel[0])
+
+    # Friend name isn't super relevant here, but load_history needs it
+    friend_name = NONAME[0]
+    _, custom_prompt, _ = load_history(chat_title, friend_name)
+
+    custom_prompt_text.configure(state='normal')
+    custom_prompt_text.delete('1.0', 'end')
+    custom_prompt_text.insert('1.0', custom_prompt)
+    custom_prompt_text.configure(state='normal') # Keep it editable
+
+async def on_send_from_gui():
+    sel = active_chats_listbox.curselection()
+    if not sel:
+        messagebox.showwarning("Ошибка", "Сначала выберите чат для отправки в списке активных."); return
+
+    chat_title = active_chats_listbox.get(sel[0])
+    chat_entity = active_chat_entities.get(chat_title)
+    if not chat_entity:
+        messagebox.showerror("Ошибка", "Не удалось найти объект чата. Попробуйте перезагрузить."); return
+
+    text = gui_message_text.get("1.0", "end-1c").strip()
+    if not text:
+        messagebox.showwarning("Ошибка", "Введите текст сообщения."); return
+
+    append_log_sync(f"~> Отправка в [{chat_title}]: {text}", "yellow")
+
+    friend_name = NONAME[0] # Or get from a per-chat setting in future
+    history, custom_prompt, hist_path = load_history(chat_title, friend_name)
+
+    # Add our GUI message to history
+    history.append({"role": "user", "content": text})
+    save_history(hist_path, history, custom_prompt)
+
+    try:
+        reply = await gemini_generate(history, friend_name, float(temp_var.get()), custom_prompt)
+    except Exception as e:
+        append_log_sync(f"[Send GUI Msg Error] {e}", "red")
+        return
+
+    if reply:
+        append_log_sync(f"<~ Ответ для [{chat_title}]: {reply}", "yellow")
+        history.append({"role": "assistant", "content": reply})
+        save_history(hist_path, history, custom_prompt)
+
+        # Clear the input box
+        gui_message_text.delete('1.0', 'end')
+
+        # Send the message to the actual chat
+        cli = await ensure_client()
+        await cli.send_message(chat_entity, reply)
+        append_log_sync(f"   (сообщение отправлено в Telegram)", "green")
+    else:
+        append_log_sync(f"[Send GUI Msg] Нет ответа от AI.", "red")
+
+
+def on_save_prompt():
+    sel = active_chats_listbox.curselection()
+    if not sel:
+        messagebox.showwarning("Ошибка", "Сначала выберите чат в списке активных."); return
+    chat_title = active_chats_listbox.get(sel[0])
+
+    prompt_content = custom_prompt_text.get("1.0", "end-1c").strip()
+
+    # We need to load the history just to save it back with the new prompt
+    friend_name = NONAME[0]
+    history, _, path = load_history(chat_title, friend_name)
+    save_history(path, history, prompt_content)
+
+    append_log_sync(f"✅ Промпт для '{chat_title}' сохранен.", "green")
+
 def on_clear_history():
-    title = _selected_chat_title()
-    if not title:
-        messagebox.showwarning("Ошибка", "Выбери чат."); return
+    sel = active_chats_listbox.curselection()
+    if not sel:
+        messagebox.showwarning("Ошибка", "Выбери активный чат."); return
+    title = active_chats_listbox.get(sel[0])
+
     idx = friend_combo.current()
     friend_name = FRIENDS[idx][0] if idx < len(FRIENDS) else NONAME[0]
     p = _history_path(title)
@@ -481,9 +682,11 @@ def on_clear_history():
         {"role": "system", "content": SYSTEM_PROMPT_TXT},
         {"role": "system", "content": f"Сейчас ты общаешься с: {friend_name}."}
     ]
-    save_history(p, hist)
+    # Also clears the custom prompt
+    save_history(p, hist, "")
+    on_active_chat_select() # Refresh the text box
     clear_log()
-    append_log("[Info] История очищена и создана заново.", "green")
+    append_log("[Info] История и доп. промпт очищены.", "green")
 
 def set_buttons(run):
     start_btn.configure(state='disabled' if run else 'normal')
@@ -526,6 +729,7 @@ def main():
 
     ensure_api_config()
     ensure_tg_config()
+    ensure_deepgram_config()
     # грузим промт/друзей из SYSTEM_PROMPT.json
     SYSTEM_PROMPT_TXT, FRIENDS, NONAME = load_prompt_config()
 
@@ -568,16 +772,18 @@ def main():
 
     main_frame = ttk.Frame(root, padding=8, style="Dark.TLabel")
     main_frame.pack(fill="both", expand=True)
-    main_frame.columnconfigure(0, weight=1)
-    main_frame.columnconfigure(1, weight=3)
+    main_frame.columnconfigure(0, weight=2)  # All chats
+    main_frame.columnconfigure(1, weight=0)  # Buttons
+    main_frame.columnconfigure(2, weight=2)  # Active chats
+    main_frame.columnconfigure(3, weight=3)  # Controls
     main_frame.rowconfigure(0, weight=1)
 
-    # левая колонка
+    # --- Левая колонка (Все чаты) ---
     left = ttk.Frame(main_frame, style="Dark.TLabel")
-    left.grid(row=0, column=0, sticky="nsew", padx=(0,8))
-    left.rowconfigure(2, weight=1)
+    left.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+    left.rowconfigure(2, weight=1); left.columnconfigure(0, weight=1)
 
-    ttk.Label(left, text="Поиск чата:", style="Dark.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(left, text="Все чаты:", style="Dark.TLabel").grid(row=0, column=0, sticky="w")
     chat_search = tk.Entry(left, bg=SEARCH_BG, fg=FG, insertbackground=FG, relief="flat")
     chat_search.grid(row=1, column=0, sticky="we", pady=4)
     chat_search.bind("<KeyRelease>", on_search)
@@ -585,13 +791,53 @@ def main():
     chat_listbox = tk.Listbox(
         left, bg=BG, fg=CHAT_COLOR,
         selectbackground=BLUE, selectforeground=FG,
-        activestyle="none", exportselection=False, width=32
+        activestyle="none", exportselection=False, width=32,
+        selectmode="extended"
     )
     chat_listbox.grid(row=2, column=0, sticky="nsew")
 
-    # правая колонка
+    # --- Средняя колонка (Кнопки) ---
+    mid_buttons = ttk.Frame(main_frame, style="Dark.TLabel")
+    mid_buttons.grid(row=0, column=1, sticky="ns", padx=4)
+    mid_buttons.rowconfigure(0, weight=1); mid_buttons.rowconfigure(1, weight=1)
+
+    add_button = ttk.Button(mid_buttons, text=">>", command=on_add_chat, style="Dark.TButton", width=4)
+    add_button.pack(pady=(150, 5))
+    remove_button = ttk.Button(mid_buttons, text="<<", command=on_remove_chat, style="Dark.TButton", width=4)
+    remove_button.pack(pady=5)
+
+    # --- Колонка активных чатов ---
+    active_chats_frame = ttk.Frame(main_frame, style="Dark.TLabel")
+    active_chats_frame.grid(row=0, column=2, sticky="nsew", padx=(0, 8))
+    active_chats_frame.rowconfigure(1, weight=3) # Listbox
+    active_chats_frame.rowconfigure(3, weight=2) # Prompt editor
+    active_chats_frame.columnconfigure(0, weight=1)
+
+    ttk.Label(active_chats_frame, text="Активные чаты:", style="Dark.TLabel").grid(row=0, column=0, sticky="w")
+
+    active_chats_listbox = tk.Listbox(
+        active_chats_frame, bg=BG, fg=FRIEND_GREEN,
+        selectbackground=BLUE, selectforeground=FG,
+        activestyle="none", exportselection=False, width=32,
+        selectmode="extended"
+    )
+    active_chats_listbox.grid(row=1, column=0, sticky="nsew", pady=(4,0))
+
+    ttk.Label(active_chats_frame, text="Доп. промпт для чата:", style="Dark.TLabel").grid(row=2, column=0, sticky="w", pady=(8,0))
+    custom_prompt_text = scrolledtext.ScrolledText(
+        active_chats_frame, height=5, bg=SEARCH_BG, fg=FG,
+        relief="flat", insertbackground=FG
+    )
+    custom_prompt_text.grid(row=3, column=0, sticky="nsew", pady=4)
+
+    save_prompt_btn = ttk.Button(active_chats_frame, text="Сохранить промпт", command=lambda: on_save_prompt(), style="Dark.TButton")
+    save_prompt_btn.grid(row=4, column=0, sticky="ew")
+
+    active_chats_listbox.bind("<<ListboxSelect>>", on_active_chat_select)
+
+    # --- Правая колонка (Управление и лог) ---
     right = ttk.Frame(main_frame, style="Dark.TLabel")
-    right.grid(row=0, column=1, sticky="nsew")
+    right.grid(row=0, column=3, sticky="nsew")
     right.columnconfigure(0, weight=1); right.columnconfigure(1, weight=1); right.columnconfigure(2, weight=1)
     right.rowconfigure(9, weight=1)
 
@@ -625,20 +871,30 @@ def main():
     restart_btn.grid(row=4, column=2, pady=6, sticky="we")
     clear_btn.grid(row=5, column=0, columnspan=3, pady=(0,6), sticky="we")
 
-    status_label = ttk.Label(right, text="Состояние: Остановлен", style="Dark.TLabel", foreground="red")
-    status_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(2,6))
+    # --- Панель отправки ---
+    ttk.Label(right, text="Отправить в выбранный чат:", style="Dark.TLabel").grid(row=6, column=0, columnspan=3, sticky="w", pady=(8,0))
+    gui_message_text = scrolledtext.ScrolledText(right, height=3, bg=SEARCH_BG, fg=FG, relief="flat", insertbackground=FG)
+    gui_message_text.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=4)
+    send_gui_msg_btn = ttk.Button(right, text="Отправить сообщение", command=lambda: run_async(on_send_from_gui()), style="Dark.TButton")
+    send_gui_msg_btn.grid(row=8, column=0, columnspan=3, sticky="ew")
 
-    ttk.Label(right, text="Лог:", style="Dark.TLabel").grid(row=7, column=0, columnspan=3, sticky="w")
+    status_label = ttk.Label(right, text="Состояние: Остановлен", style="Dark.TLabel", foreground="red")
+    status_label.grid(row=9, column=0, columnspan=3, sticky="w", pady=(2,6))
+
+    ttk.Label(right, text="Лог:", style="Dark.TLabel").grid(row=10, column=0, columnspan=3, sticky="w")
     log_text = scrolledtext.ScrolledText(right, width=80, height=18, bg=BG, fg=FG,
                                          insertbackground=FG, relief="flat")
     log_text.tag_config("violet", foreground="#b388ff")
     log_text.tag_config("green",  foreground="lightgreen")
     log_text.tag_config("red",    foreground="red")
     log_text.tag_config("white",  foreground="white")
-    log_text.grid(row=8, column=0, columnspan=3, sticky="nsew")
+    log_text.tag_config("yellow", foreground="#FFFF88")
+    log_text.grid(row=11, column=0, columnspan=3, sticky="nsew")
 
     # Привязываем в глобальные
     globals().update(locals())
+    globals()["custom_prompt_text"] = custom_prompt_text
+    globals()["gui_message_text"] = gui_message_text
 
     # Фоновый event loop
     loop_thread = threading.Thread(target=start_background_loop, daemon=True)
