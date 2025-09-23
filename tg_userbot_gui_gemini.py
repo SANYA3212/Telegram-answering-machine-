@@ -732,8 +732,11 @@ def on_save_prompt():
 
     prompt_content = custom_prompt_text.get("1.0", "end-1c").strip()
 
-    # We need to load the history just to save it back with the new prompt
-    friend_name = NONAME[0]
+    # Get the correct friend context for this chat
+    chat_data = active_chat_entities.get(chat_title, {})
+    friend_index = chat_data.get("friend_index", len(FRIENDS))
+    friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
+
     history, _, path = load_history(chat_title, friend_name)
     save_history(path, history, prompt_content)
 
