@@ -342,9 +342,16 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
     full_system_prompt = f"{SYSTEM_PROMPT_TXT}\n\n{custom_prompt}\n\nСейчас ты общаешься с: {friend_name}."
 
     payload = {
-        "systemInstruction": {"role": "system", "parts": [{"text": full_system_prompt}]},
+        "system_instruction": {
+            "role": "system",
+            "parts": [{"text": full_system_prompt}]
+        },
         "contents": _history_to_gemini_contents(history),
-        "generationConfig": {"temperature": float(temperature), "topP": 0.95, "maxOutputTokens": 1024}
+        "generation_config": {
+            "temperature": float(temperature),
+            "top_p": 0.95,
+            "max_output_tokens": 1024
+        }
     }
     headers = {"Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=90) as cli:
