@@ -20,3 +20,31 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+
+
+### Python & Telegram UserBot ###
+
+# Session files
+*.session
+*.session-journal
+
+# Configuration files
+# These may contain sensitive API keys and should not be committed.
+# The application will generate templates on first run.
+telegram_api.json
+api_text_model.json
+deepgram_api.json
+gui_state.json
+
+# IDE and cache files
+__pycache__/
+.vscode/
+.idea/
+
+# Distribution files
+dist/
+build/
+*.spec
+
+# Logs
+*.log

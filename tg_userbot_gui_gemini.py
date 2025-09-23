@@ -34,6 +34,7 @@ API_FILE    = os.path.join(BASE_DIR, "api_text_model.json")
 TG_FILE     = os.path.join(BASE_DIR, "telegram_api.json")
 PROMPT_FILE = os.path.join(BASE_DIR, "SYSTEM_PROMPT.json")
 DEEPGRAM_FILE = os.path.join(BASE_DIR, "deepgram_api.json")
+STATE_FILE = os.path.join(BASE_DIR, "gui_state.json")
 os.makedirs(CHATS_DIR, exist_ok=True)
 
 # ===================== Конфиги API/Telegram =====================
@@ -320,10 +321,10 @@ async def transcribe_audio(media_buffer):
         audio.export(mp3_buffer, format="mp3")
         mp3_buffer.seek(0)
 
-        payload: FileSource = {"buffer": mp3_buffer, "mimetype": "audio/mpeg"}
+        payload: FileSource = {"buffer": mp3_buffer}
         options = PrerecordedOptions(model="nova-2-general", language="ru", smart_format=True)
 
-        response = await dg_client.listen.prerecorded.v("1").transcribe_file(payload, options)
+        response = await dg_client.listen.rest.v("1").transcribe_file(payload, options)
         transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
         return transcript
 
@@ -413,10 +414,9 @@ async def multi_chat_handler(evt):
     chat_title = active_chat_id_map.get(chat_id)
     if not chat_title: return # Not a chat we are monitoring
 
-    # This part is a bit tricky. We need to get the "friend" context.
-    # For now, let's use the default "Noname" for all.
-    # A better implementation would store this per-chat.
-    friend_name = NONAME[0]
+    chat_data = active_chat_entities.get(chat_title, {})
+    friend_index = chat_data.get("friend_index", len(FRIENDS))
+    friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
 
     history, custom_prompt, hist_path = load_history(chat_title, friend_name)
     append_log_sync(f"-> Msg in [{chat_title}]", "green")
@@ -523,12 +523,14 @@ def update_chat_list(dialogs, clear_selection=False):
     if clear_selection:
         chat_listbox.selection_clear(0, 'end')
 
-def refresh_dialogs_from_async(clear_selection=False):
+def refresh_dialogs_from_async(clear_selection=False, on_done=None):
     def _done(fut):
         try:
             ds = fut.result()
             root.after(0, update_chat_list, ds, clear_selection)
             append_log_sync("Список чатов обновлён.", "green")
+            if on_done:
+                on_done()
         except Exception as e:
             append_log_sync(f"[Refresh Error] {e}", "red")
     fut = run_async(get_dialogs())
@@ -573,14 +575,17 @@ def on_add_chat():
         return
 
     current_active_chats = active_chats_listbox.get(0, "end")
+    selected_friend_index = friend_combo.current()
 
     for i in selected_indices:
         chat_name, chat_entity = filtered_chats[i]
 
-        # Store entity in a global dict for later access
-        active_chat_entities[chat_name] = chat_entity
-
         if chat_name not in current_active_chats:
+            # Store entity and current friend context
+            active_chat_entities[chat_name] = {
+                "entity": chat_entity,
+                "friend_index": selected_friend_index
+            }
             active_chats_listbox.insert("end", chat_name)
 
 def on_remove_chat():
@@ -598,16 +603,21 @@ def on_remove_chat():
 def on_active_chat_select(_=None):
     sel = active_chats_listbox.curselection()
     if not sel: return
-    chat_title = active_chats_listbox.get(sel[0])
+    chat_name = active_chats_listbox.get(sel[0])
 
-    # Friend name isn't super relevant here, but load_history needs it
-    friend_name = NONAME[0]
-    _, custom_prompt, _ = load_history(chat_title, friend_name)
+    append_log_sync(f"Фокус на чат: [{chat_name}]. Загружен доп. промпт.", "green")
+
+    # Update friend combobox to reflect the stored friend for this chat
+    friend_index = active_chat_entities.get(chat_name, {}).get("friend_index", 0)
+    friend_combo.current(friend_index)
+
+    friend_name = FRIENDS[friend_index][0]
+    _, custom_prompt, _ = load_history(chat_name, friend_name)
 
     custom_prompt_text.configure(state='normal')
     custom_prompt_text.delete('1.0', 'end')
     custom_prompt_text.insert('1.0', custom_prompt)
-    custom_prompt_text.configure(state='normal') # Keep it editable
+    custom_prompt_text.configure(state='normal')
 
 async def on_send_from_gui():
     sel = active_chats_listbox.curselection()
@@ -615,7 +625,8 @@ async def on_send_from_gui():
         messagebox.showwarning("Ошибка", "Сначала выберите чат для отправки в списке активных."); return
 
     chat_title = active_chats_listbox.get(sel[0])
-    chat_entity = active_chat_entities.get(chat_title)
+    chat_data = active_chat_entities.get(chat_title, {})
+    chat_entity = chat_data.get("entity")
     if not chat_entity:
         messagebox.showerror("Ошибка", "Не удалось найти объект чата. Попробуйте перезагрузить."); return
 
@@ -625,7 +636,8 @@ async def on_send_from_gui():
 
     append_log_sync(f"~> Отправка в [{chat_title}]: {text}", "yellow")
 
-    friend_name = NONAME[0] # Or get from a per-chat setting in future
+    friend_index = chat_data.get("friend_index", len(FRIENDS))
+    friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
     history, custom_prompt, hist_path = load_history(chat_title, friend_name)
 
     # Add our GUI message to history
@@ -646,12 +658,55 @@ async def on_send_from_gui():
         # Clear the input box
         gui_message_text.delete('1.0', 'end')
 
-        # Send the message to the actual chat
+        # This function is for "private" interaction with the AI.
+        # We no longer send the message to the Telegram chat here.
+        # await cli.send_message(chat_entity, reply)
+        append_log_sync(f"   (переписка сохранена в историю)", "green")
+    else:
+        append_log_sync(f"[Send GUI Msg] Нет ответа от AI.", "red")
+
+
+async def on_send_to_focused_chat():
+    sel = active_chats_listbox.curselection()
+    if not sel:
+        messagebox.showwarning("Ошибка", "Сначала выберите чат для отправки в списке активных."); return
+
+    chat_title = active_chats_listbox.get(sel[0])
+    chat_data = active_chat_entities.get(chat_title, {})
+    chat_entity = chat_data.get("entity")
+    if not chat_entity:
+        messagebox.showerror("Ошибка", "Не удалось найти объект чата. Попробуйте перезагрузить."); return
+
+    text = gui_message_text.get("1.0", "end-1c").strip()
+    if not text:
+        messagebox.showwarning("Ошибка", "Введите текст сообщения."); return
+
+    append_log_sync(f"~> Отправка в TELEGRAM [{chat_title}]: {text}", "yellow")
+
+    friend_index = chat_data.get("friend_index", len(FRIENDS))
+    friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
+    history, custom_prompt, hist_path = load_history(chat_title, friend_name)
+
+    history.append({"role": "user", "content": text})
+
+    try:
+        reply = await gemini_generate(history, friend_name, float(temp_var.get()), custom_prompt)
+    except Exception as e:
+        append_log_sync(f"[Send TG Msg Error] {e}", "red")
+        return
+
+    if reply:
+        append_log_sync(f"<~ Ответ для [{chat_title}]: {reply}", "yellow")
+        history.append({"role": "assistant", "content": reply})
+        save_history(hist_path, history, custom_prompt)
+
+        gui_message_text.delete('1.0', 'end')
+
         cli = await ensure_client()
         await cli.send_message(chat_entity, reply)
         append_log_sync(f"   (сообщение отправлено в Telegram)", "green")
     else:
-        append_log_sync(f"[Send GUI Msg] Нет ответа от AI.", "red")
+        append_log_sync(f"[Send TG Msg] Нет ответа от AI.", "red")
 
 
 def on_save_prompt():
@@ -696,8 +751,69 @@ def set_buttons(run):
     status_label.configure(text="Состояние: Запущен" if run else "Состояние: Остановлен",
                            foreground="lightgreen" if run else "red")
 
+def save_gui_state():
+    try:
+        # Check if GUI widgets have been initialized
+        if not all([active_chats_listbox, temp_var, friend_combo, see_my_msgs_var]):
+            print("GUI not fully initialized, skipping state save.")
+            return
+
+        # This now needs to store friend context for each chat
+        active_chats_data = []
+        for chat_name in active_chats_listbox.get(0, "end"):
+            friend_index = active_chat_entities[chat_name].get("friend_index", 0)
+            active_chats_data.append({"name": chat_name, "friend_index": friend_index})
+
+        state = {
+            "active_chats": active_chats_data,
+            "temperature": temp_var.get(),
+            "friend_index": friend_combo.current(), # Save last selected global friend
+            "see_my_msgs": see_my_msgs_var.get()
+        }
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        # Don't crash the app if saving state fails
+        print(f"Failed to save GUI state: {e}")
+
+def load_gui_state():
+    if not os.path.exists(STATE_FILE):
+        return None
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Failed to load GUI state: {e}")
+        return None
+
+def on_friend_change(_=None):
+    sel = active_chats_listbox.curselection()
+    if not sel: return # No active chat selected, do nothing
+
+    chat_name = active_chats_listbox.get(sel[0])
+    new_friend_index = friend_combo.current()
+
+    if chat_name in active_chat_entities:
+        active_chat_entities[chat_name]["friend_index"] = new_friend_index
+        append_log_sync(f"Для чата [{chat_name}] установлен друг: {friend_combo.get()}", "green")
+
+def restore_active_chats(active_chats_data):
+    """Helper to restore active chats after main dialog list is populated."""
+    for chat_data in active_chats_data:
+        name = chat_data.get("name")
+        friend_index = chat_data.get("friend_index", 0)
+        if not name: continue
+
+        for chat_name, chat_entity in chat_entities:
+            if chat_name == name:
+                if name not in active_chats_listbox.get(0, "end"):
+                    active_chats_listbox.insert("end", name)
+                    active_chat_entities[name] = {"entity": chat_entity, "friend_index": friend_index}
+                break
+
 def on_close():
-    run_async(stop_bot())
+    save_gui_state()
+    run_async(stop_listeners())
     if aio_loop: aio_loop.call_soon_threadsafe(aio_loop.stop)
     root.destroy()
 
@@ -847,6 +963,7 @@ def main():
     friend_combo.current(0)
     friend_combo.grid(row=1, column=0, columnspan=3, sticky="we", pady=(0,6))
     style_combobox_dropdown(friend_combo, bg="#101010", fg="#ffffff", sel_bg="#0f0f0f", sel_fg="#17a556")
+    friend_combo.bind("<<ComboboxSelected>>", on_friend_change)
 
     see_my_msgs_var = tk.BooleanVar(value=False)
     ttk.Checkbutton(right, text="Видеть мои сообщения", variable=see_my_msgs_var, style="Dark.TCheckbutton")\
@@ -875,13 +992,17 @@ def main():
     ttk.Label(right, text="Отправить в выбранный чат:", style="Dark.TLabel").grid(row=6, column=0, columnspan=3, sticky="w", pady=(8,0))
     gui_message_text = scrolledtext.ScrolledText(right, height=3, bg=SEARCH_BG, fg=FG, relief="flat", insertbackground=FG)
     gui_message_text.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=4)
-    send_gui_msg_btn = ttk.Button(right, text="Отправить сообщение", command=lambda: run_async(on_send_from_gui()), style="Dark.TButton")
-    send_gui_msg_btn.grid(row=8, column=0, columnspan=3, sticky="ew")
+    send_gui_msg_btn = ttk.Button(right, text="Спросить ИИ (приватно)", command=lambda: run_async(on_send_from_gui()), style="Dark.TButton")
+    send_gui_msg_btn.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(0,2))
+
+    send_to_tg_btn = ttk.Button(right, text="Отправить ответ в ЧАТ В ФОКУСЕ", command=lambda: run_async(on_send_to_focused_chat()), style="Dark.TButton")
+    send_to_tg_btn.grid(row=9, column=0, columnspan=3, sticky="ew")
+
 
     status_label = ttk.Label(right, text="Состояние: Остановлен", style="Dark.TLabel", foreground="red")
-    status_label.grid(row=9, column=0, columnspan=3, sticky="w", pady=(2,6))
+    status_label.grid(row=10, column=0, columnspan=3, sticky="w", pady=(2,6))
 
-    ttk.Label(right, text="Лог:", style="Dark.TLabel").grid(row=10, column=0, columnspan=3, sticky="w")
+    ttk.Label(right, text="Лог:", style="Dark.TLabel").grid(row=11, column=0, columnspan=3, sticky="w")
     log_text = scrolledtext.ScrolledText(right, width=80, height=18, bg=BG, fg=FG,
                                          insertbackground=FG, relief="flat")
     log_text.tag_config("violet", foreground="#b388ff")
@@ -889,7 +1010,7 @@ def main():
     log_text.tag_config("red",    foreground="red")
     log_text.tag_config("white",  foreground="white")
     log_text.tag_config("yellow", foreground="#FFFF88")
-    log_text.grid(row=11, column=0, columnspan=3, sticky="nsew")
+    log_text.grid(row=12, column=0, columnspan=3, sticky="nsew")
 
     # Привязываем в глобальные
     globals().update(locals())
@@ -901,7 +1022,24 @@ def main():
     loop_thread.start()
     aio_loop_ready.wait()
 
-    refresh_dialogs_from_async()
+    # Load state first, then refresh dialogs with a callback to restore the state
+    saved_state = load_gui_state()
+
+    def _restore_state_callback():
+        if not saved_state:
+            return
+
+        # Restore simple widgets
+        temp_var.set(saved_state.get("temperature", 0.7))
+        friend_combo.current(saved_state.get("friend_index", 0))
+        see_my_msgs_var.set(saved_state.get("see_my_msgs", False))
+
+        # Restore active chats list
+        active_chats_to_restore = saved_state.get("active_chats", [])
+        if active_chats_to_restore:
+            restore_active_chats(active_chats_to_restore)
+
+    refresh_dialogs_from_async(on_done=_restore_state_callback)
     set_buttons(False)
 
     root.protocol("WM_DELETE_WINDOW", on_close)
