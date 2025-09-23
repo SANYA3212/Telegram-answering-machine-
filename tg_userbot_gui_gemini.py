@@ -13,7 +13,6 @@ import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 from collections import deque
 import sys  # <<<<< добавлено
-from pydub import AudioSegment
 
 import httpx
 from telethon import TelegramClient, events
@@ -309,20 +308,14 @@ def _history_to_gemini_contents(history):
 
 async def transcribe_audio(media_buffer):
     """
-    Converts an audio buffer from ogg to mp3 and transcribes it using Deepgram.
+    Sends an audio buffer directly to Deepgram for transcription.
     """
     try:
         api_key = load_deepgram_config()
         dg_client = DeepgramClient(api_key)
 
         media_buffer.seek(0)
-        audio = AudioSegment.from_file(media_buffer, format="ogg")
-
-        mp3_buffer = io.BytesIO()
-        audio.export(mp3_buffer, format="mp3")
-        mp3_buffer.seek(0)
-
-        payload: FileSource = {"buffer": mp3_buffer}
+        payload: FileSource = {"buffer": media_buffer}
         options = PrerecordedOptions(model="nova-2-general", language="ru", smart_format=True)
 
         response = await dg_client.listen.rest.v("1").transcribe_file(payload, options)
