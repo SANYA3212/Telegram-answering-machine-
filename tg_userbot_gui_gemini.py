@@ -212,6 +212,7 @@ async def acquire_rate_slot(limit_per_min: int):
             _rate_window.popleft()
         if len(_rate_window) >= limit_per_min:
             wait = 60 - (now - _rate_window[0]) + 0.02
+            append_log_sync(f"[Rate Limit] Превышен лимит RPM ({limit_per_min}/min). Ожидаю {wait:.2f} сек...", "yellow")
             await asyncio.sleep(max(0.0, wait))
         _rate_window.append(time.time())
 
@@ -347,6 +348,9 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
     async with httpx.AsyncClient(timeout=90) as cli:
         await acquire_rate_slot(rpm)
         r = await cli.post(endpoint, headers=headers, json=payload)
+
+        append_log_sync(f"[API Response Raw] {r.text}", "grey") # Log raw response
+
         if r.status_code >= 400:
             try:
                 js = r.json()
@@ -488,9 +492,11 @@ async def start_listeners():
     me = await cli.get_me()
 
     # Create a map of chat_id -> chat_title for the handler
-    active_chat_id_map = {entity.id: name for name, entity in active_chat_entities.items()}
+    active_chat_id_map = {
+        v["entity"].id: k for k, v in active_chat_entities.items()
+    }
 
-    entities = list(active_chat_entities.values())
+    entities = [v["entity"] for v in active_chat_entities.values()]
 
     handler_ref = multi_chat_handler
     cli.add_event_handler(handler_ref, events.NewMessage(chats=entities))
@@ -1010,6 +1016,7 @@ def main():
     log_text.tag_config("red",    foreground="red")
     log_text.tag_config("white",  foreground="white")
     log_text.tag_config("yellow", foreground="#FFFF88")
+    log_text.tag_config("grey",   foreground="grey")
     log_text.grid(row=12, column=0, columnspan=3, sticky="nsew")
 
     # Привязываем в глобальные
