@@ -308,7 +308,7 @@ def _history_to_gemini_contents(history):
 
 async def transcribe_audio(media_buffer):
     """
-    Sends an audio buffer directly to Deepgram for transcription.
+    Sends an audio buffer directly to Deepgram for transcription using a thread.
     """
     try:
         api_key = load_deepgram_config()
@@ -316,9 +316,18 @@ async def transcribe_audio(media_buffer):
 
         media_buffer.seek(0)
         payload: FileSource = {"buffer": media_buffer.read()}
-        options = PrerecordedOptions(model="nova-2-general", language="ru", smart_format=True)
+        options = PrerecordedOptions(
+            model="nova-2-general",
+            language="ru",
+            smart_format=True
+        )
 
-        response = await dg_client.listen.rest.v("1").transcribe_file(payload, options)
+        # The SDK's transcribe_file is synchronous, so we run it in a separate thread
+        # to avoid blocking the asyncio event loop.
+        response = await asyncio.to_thread(
+            dg_client.listen.rest.v("1").transcribe_file, payload, options
+        )
+
         transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
         return transcript
 
