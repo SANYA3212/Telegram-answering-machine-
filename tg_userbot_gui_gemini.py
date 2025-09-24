@@ -17,6 +17,7 @@ import sys  # <<<<< добавлено
 import httpx
 from telethon import TelegramClient, events
 from deepgram import DeepgramClient, PrerecordedOptions, FileSource
+from PIL import Image
 
 # ===================== Папки/файлы =====================
 # onefile-режим PyInstaller: писать рядом с .exe
@@ -198,6 +199,7 @@ active_chat_entities = {}
 active_chat_id_map = {}
 custom_prompt_text = None
 gui_message_text = None
+verbose_logging_var = None
 
 # ===================== Rate limit (RPM) =====================
 _rate_lock = asyncio.Lock()
@@ -260,17 +262,45 @@ def clear_log():
     if not log_text: return
     log_text.configure(state='normal'); log_text.delete('1.0','end'); log_text.configure(state='disabled')
 
-def append_log(text: str, tag="white"):
-    if not log_text:
-        print(text); return
-    log_text.configure(state='normal')
-    log_text.insert('end', text + '\n', tag)
-    log_text.see('end')
-    log_text.configure(state='disabled')
+def log_message(text: str, level: str = "info"):
+    """
+    Logs a message to the console.log file and optionally to the GUI.
+    Levels: 'info', 'error', 'debug', 'focus'.
+    """
+    # --- File Logging (always on) ---
+    log_file_path = os.path.join(BASE_DIR, "console.log")
+    try:
+        with open(log_file_path, "a", encoding="utf-8") as f:
+            f.write(f"[{level.upper()}] {text}\n")
+    except Exception as e:
+        print(f"Failed to write to log file: {e}")
 
-def append_log_sync(text: str, tag="white"):
-    if root: root.after(0, append_log, text, tag)
-    else: print(text)
+    # --- GUI Logging ---
+    if not root or not log_text:
+        print(text)
+        return
+
+    # Map level to color tag
+    tag_map = {
+        "info": "green",
+        "error": "red",
+        "focus": "violet",
+        "debug": "grey",
+        "warning": "yellow",
+        "user": "white"
+    }
+    tag = tag_map.get(level, "white")
+
+    def _append_to_gui():
+        # Only show non-errors if verbose logging is on
+        if level != 'error' and not (verbose_logging_var and verbose_logging_var.get()):
+             return
+        log_text.configure(state='normal')
+        log_text.insert('end', text + '\n', tag)
+        log_text.see('end')
+        log_text.configure(state='disabled')
+
+    root.after(0, _append_to_gui)
 
 def render_history_to_log(history):
     shown = 0
@@ -278,11 +308,11 @@ def render_history_to_log(history):
         r = m.get("role"); c = m.get("content","")
         if r == "system": continue
         if isinstance(c, str) and c.startswith("DATA:image/"): c = "<media>"
-        if r == "user": append_log_sync(f"[User] {c}", "white")
-        elif r == "assistant": append_log_sync(f"[Sanya] {c}", "violet")
-        else: append_log_sync(str(c), "white")
+        if r == "user": log_message(f"[User] {c}", level="user")
+        elif r == "assistant": log_message(f"[Sanya] {c}", level="focus")
+        else: log_message(str(c), level="user")
         shown += 1
-    append_log_sync(f"📜 История загружена: {shown} сообщений.", "green")
+    log_message(f"📜 История загружена: {shown} сообщений.", level="info")
 
 # ===================== Gemini (REST v1beta) =====================
 def _history_to_gemini_contents(history):
@@ -332,7 +362,7 @@ async def transcribe_audio(media_buffer):
         return transcript
 
     except Exception as e:
-        append_log_sync(f"[Deepgram Error] {e}", "red")
+        log_message(f"[Deepgram Error] {e}", level="error")
         return None
 
 async def gemini_generate(history, friend_name: str, temperature: float, custom_prompt: str):
@@ -358,7 +388,7 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
         await acquire_rate_slot(rpm)
         r = await cli.post(endpoint, headers=headers, json=payload)
 
-        append_log_sync(f"[API Response Raw] {r.text}", "grey") # Log raw response
+        log_message(f"[API Response Raw] {r.text}", level="debug")
 
         if r.status_code >= 400:
             try:
@@ -409,7 +439,7 @@ async def get_dialogs():
             out.append((name, d.entity))
         return out
     except Exception as e:
-        append_log_sync(f"[Dialogs Error] {e}", "red")
+        log_message(f"[Dialogs Error] {e}", level="error")
         return []
 
 async def multi_chat_handler(evt):
@@ -432,35 +462,62 @@ async def multi_chat_handler(evt):
     friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
 
     history, custom_prompt, hist_path = load_history(chat_title, friend_name)
-    append_log_sync(f"-> Msg in [{chat_title}]", "green")
+    log_message(f"-> Msg in [{chat_title}]", level="info")
 
     entry = None
     is_voice = evt.message.voice
 
     if is_voice:
-        append_log_sync(f"  [User] <голосовое сообщение>", "white")
+        log_message(f"  [User] <голосовое сообщение>", level="user")
         buf = io.BytesIO()
         await cli.download_media(evt.message, buf)
         transcribed_text = await transcribe_audio(buf)
         buf.close()
         if transcribed_text:
-            append_log_sync(f"  [Transcription] {transcribed_text}", "green")
+            log_message(f"  [Transcription] {transcribed_text}", level="info")
             entry = transcribed_text
         else:
-            append_log_sync(f"  [Transcription] Не удалось распознать речь.", "red")
+            log_message(f"  [Transcription] Не удалось распознать речь.", level="error")
 
     elif evt.media:
-        append_log_sync(f"  [User] <media>", "white")
+        log_message(f"  [User] <media>", level="user")
+
+        # 1) Determine MIME type from Telegram
+        mime = None
+        try:
+            if getattr(evt.message, "file", None) and getattr(evt.message.file, "mime_type", None):
+                mime = evt.message.file.mime_type
+            elif getattr(evt, "photo", None) or getattr(evt.message, "photo", None):
+                mime = "image/jpeg"  # Telegram Photo objects are usually jpeg
+        except Exception:
+            pass
+
         buf = io.BytesIO()
         await cli.download_media(evt.media, buf)
-        buf.seek(0)
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        data = buf.getvalue()
         buf.close()
-        entry = f"DATA:image/png;base64,{b64}"
+
+        # 2) If type is not supported, try to convert to PNG
+        supported_mimes = {"image/png", "image/jpeg", "image/webp", "image/gif", "image/heic"}
+        if mime not in supported_mimes:
+            try:
+                log_message(f"  [Image] Unsupported type '{mime}', converting to PNG...", level="debug")
+                img = Image.open(io.BytesIO(data))
+                out_buf = io.BytesIO()
+                img.save(out_buf, format="PNG")
+                data = out_buf.getvalue()
+                mime = "image/png"
+            except Exception as e:
+                log_message(f"[Image Error] Failed to convert image: {e}", level="error")
+                return # Skip this message
+
+        # 3) Create the DATA URL with the correct mime type
+        b64 = base64.b64encode(data).decode("ascii")
+        entry = f"DATA:{mime};base64,{b64}"
 
     else:
         text = (evt.raw_text or "").strip()
-        append_log_sync(f"  [User] {text}", "white")
+        log_message(f"  [User] {text}", level="user")
         if text:
             entry = text
 
@@ -474,12 +531,12 @@ async def multi_chat_handler(evt):
         try:
             reply = await gemini_generate(history, friend_name=friend_name, temperature=float(temp_var.get()), custom_prompt=custom_prompt)
         except httpx.HTTPStatusError as he:
-            append_log_sync(f"  [Gemini HTTP] {he}", "red"); return
+            log_message(f"  [Gemini HTTP] {he}", level="error"); return
         except Exception as e:
-            append_log_sync(f"  [Gemini Error] {e}", "red"); return
+            log_message(f"  [Gemini Error] {e}", level="error"); return
 
     if reply:
-        append_log_sync(f"  [Sanya] {reply}", "violet")
+        log_message(f"  [Sanya] {reply}", level="focus")
         history.append({"role": "assistant", "content": reply})
         save_history(hist_path, history, custom_prompt)
         if bot_running:
@@ -512,9 +569,9 @@ async def start_listeners():
 
     bot_running = True
     clear_log()
-    append_log_sync(f"✅ Подключено как {me.first_name} (id={me.id})", "violet")
-    append_log_sync(f"🤖 Провайдер: gemini | Модель: {model}", "green")
-    append_log_sync(f"🚀 Мост запущен для {len(entities)} чатов. Жду сообщения.", "green")
+    log_message(f"✅ Подключено как {me.first_name} (id={me.id})", level="focus")
+    log_message(f"🤖 Провайдер: gemini | Модель: {model}", level="info")
+    log_message(f"🚀 Мост запущен для {len(entities)} чатов. Жду сообщения.", level="info")
 
 async def stop_listeners():
     global handler_ref, bot_running
@@ -525,7 +582,7 @@ async def stop_listeners():
         except Exception:
             pass
     handler_ref = None
-    append_log_sync("⛔ Бот остановлен.", "red")
+    log_message("⛔ Бот остановлен.", level="error")
 
 # ===================== GUI =====================
 def update_chat_list(dialogs, clear_selection=False):
@@ -543,11 +600,11 @@ def refresh_dialogs_from_async(clear_selection=False, on_done=None):
         try:
             ds = fut.result()
             root.after(0, update_chat_list, ds, clear_selection)
-            append_log_sync("Список чатов обновлён.", "green")
+            log_message("Список чатов обновлён.", level="info")
             if on_done:
                 on_done()
         except Exception as e:
-            append_log_sync(f"[Refresh Error] {e}", "red")
+            log_message(f"[Refresh Error] {e}", level="error")
     fut = run_async(get_dialogs())
     fut.add_done_callback(_done)
 
@@ -620,14 +677,15 @@ def on_active_chat_select(_=None):
     if not sel: return
     chat_name = active_chats_listbox.get(sel[0])
 
-    append_log_sync(f"Фокус на чат: [{chat_name}]. Загружен доп. промпт.", "green")
+    log_message(f"Фокус на чат: [{chat_name}].", level="info")
 
-    # Update friend combobox to reflect the stored friend for this chat
     friend_index = active_chat_entities.get(chat_name, {}).get("friend_index", 0)
+    log_message(f"  [DEBUG] Found friend_index: {friend_index} for chat '{chat_name}'", level="debug")
     friend_combo.current(friend_index)
 
     friend_name = FRIENDS[friend_index][0]
     _, custom_prompt, _ = load_history(chat_name, friend_name)
+    log_message(f"  [DEBUG] Loaded custom_prompt: '{custom_prompt[:50]}...'", level="debug")
 
     custom_prompt_text.configure(state='normal')
     custom_prompt_text.delete('1.0', 'end')
@@ -649,7 +707,7 @@ async def on_send_from_gui():
     if not text:
         messagebox.showwarning("Ошибка", "Введите текст сообщения."); return
 
-    append_log_sync(f"~> Отправка в [{chat_title}]: {text}", "yellow")
+    log_message(f"~> Отправка в [{chat_title}]: {text}", level="warning")
 
     friend_index = chat_data.get("friend_index", len(FRIENDS))
     friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
@@ -662,11 +720,11 @@ async def on_send_from_gui():
     try:
         reply = await gemini_generate(history, friend_name, float(temp_var.get()), custom_prompt)
     except Exception as e:
-        append_log_sync(f"[Send GUI Msg Error] {e}", "red")
+        log_message(f"[Send GUI Msg Error] {e}", level="error")
         return
 
     if reply:
-        append_log_sync(f"<~ Ответ для [{chat_title}]: {reply}", "yellow")
+        log_message(f"<~ Ответ для [{chat_title}]: {reply}", level="warning")
         history.append({"role": "assistant", "content": reply})
         save_history(hist_path, history, custom_prompt)
 
@@ -676,9 +734,9 @@ async def on_send_from_gui():
         # This function is for "private" interaction with the AI.
         # We no longer send the message to the Telegram chat here.
         # await cli.send_message(chat_entity, reply)
-        append_log_sync(f"   (переписка сохранена в историю)", "green")
+        log_message(f"   (переписка сохранена в историю)", level="info")
     else:
-        append_log_sync(f"[Send GUI Msg] Нет ответа от AI.", "red")
+        log_message(f"[Send GUI Msg] Нет ответа от AI.", level="error")
 
 
 async def on_send_to_focused_chat():
@@ -696,7 +754,7 @@ async def on_send_to_focused_chat():
     if not text:
         messagebox.showwarning("Ошибка", "Введите текст сообщения."); return
 
-    append_log_sync(f"~> Отправка в TELEGRAM [{chat_title}]: {text}", "yellow")
+    log_message(f"~> Отправка в TELEGRAM [{chat_title}]: {text}", level="warning")
 
     friend_index = chat_data.get("friend_index", len(FRIENDS))
     friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
@@ -707,11 +765,11 @@ async def on_send_to_focused_chat():
     try:
         reply = await gemini_generate(history, friend_name, float(temp_var.get()), custom_prompt)
     except Exception as e:
-        append_log_sync(f"[Send TG Msg Error] {e}", "red")
+        log_message(f"[Send TG Msg Error] {e}", level="error")
         return
 
     if reply:
-        append_log_sync(f"<~ Ответ для [{chat_title}]: {reply}", "yellow")
+        log_message(f"<~ Ответ для [{chat_title}]: {reply}", level="warning")
         history.append({"role": "assistant", "content": reply})
         save_history(hist_path, history, custom_prompt)
 
@@ -719,9 +777,9 @@ async def on_send_to_focused_chat():
 
         cli = await ensure_client()
         await cli.send_message(chat_entity, reply)
-        append_log_sync(f"   (сообщение отправлено в Telegram)", "green")
+        log_message(f"   (сообщение отправлено в Telegram)", level="info")
     else:
-        append_log_sync(f"[Send TG Msg] Нет ответа от AI.", "red")
+        log_message(f"[Send TG Msg] Нет ответа от AI.", level="error")
 
 
 def on_save_prompt():
@@ -731,16 +789,18 @@ def on_save_prompt():
     chat_title = active_chats_listbox.get(sel[0])
 
     prompt_content = custom_prompt_text.get("1.0", "end-1c").strip()
+    log_message(f"Saving prompt for '{chat_title}'. Content: '{prompt_content[:50]}...'", level="debug")
 
     # Get the correct friend context for this chat
     chat_data = active_chat_entities.get(chat_title, {})
     friend_index = chat_data.get("friend_index", len(FRIENDS))
     friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
+    log_message(f"  [DEBUG] Using friend_name '{friend_name}' for save.", level="debug")
 
     history, _, path = load_history(chat_title, friend_name)
     save_history(path, history, prompt_content)
 
-    append_log_sync(f"✅ Промпт для '{chat_title}' сохранен.", "green")
+    log_message(f"✅ Промпт для '{chat_title}' сохранен.", level="info")
 
 def on_clear_history():
     sel = active_chats_listbox.curselection()
@@ -759,7 +819,7 @@ def on_clear_history():
     save_history(p, hist, "")
     on_active_chat_select() # Refresh the text box
     clear_log()
-    append_log("[Info] История и доп. промпт очищены.", "green")
+    log_message("[Info] История и доп. промпт очищены.", level="info")
 
 def set_buttons(run):
     start_btn.configure(state='disabled' if run else 'normal')
@@ -806,14 +866,15 @@ def load_gui_state():
 
 def on_friend_change(_=None):
     sel = active_chats_listbox.curselection()
-    if not sel: return # No active chat selected, do nothing
+    if not sel: return
 
     chat_name = active_chats_listbox.get(sel[0])
     new_friend_index = friend_combo.current()
 
     if chat_name in active_chat_entities:
         active_chat_entities[chat_name]["friend_index"] = new_friend_index
-        append_log_sync(f"Для чата [{chat_name}] установлен друг: {friend_combo.get()}", "green")
+        log_message(f"Friend context updated for '{chat_name}'. New index: {new_friend_index}", level="debug")
+    log_message(f"Для чата [{chat_name}] установлен друг: {friend_combo.get()}", level="info")
 
 def restore_active_chats(active_chats_data):
     """Helper to restore active chats after main dialog list is populated."""
@@ -856,9 +917,17 @@ def style_combobox_dropdown(cb: ttk.Combobox, bg="#101010", fg="#ffffff",
     cb.after(300, _apply)
 
 def main():
+    # Delete old log file on startup
+    log_file_path = os.path.join(BASE_DIR, "console.log")
+    if os.path.exists(log_file_path):
+        try:
+            os.remove(log_file_path)
+        except OSError as e:
+            print(f"Error removing log file: {e}")
+
     global root, chat_listbox, chat_search, friend_combo, log_text
     global start_btn, stop_btn, restart_btn, clear_btn, status_label
-    global see_my_msgs_var, temp_var, temp_value_label
+    global see_my_msgs_var, temp_var, temp_value_label, verbose_logging_var
     global SYSTEM_PROMPT_TXT, FRIENDS, NONAME
 
     ensure_api_config()
@@ -973,7 +1042,7 @@ def main():
     right = ttk.Frame(main_frame, style="Dark.TLabel")
     right.grid(row=0, column=3, sticky="nsew")
     right.columnconfigure(0, weight=1); right.columnconfigure(1, weight=1); right.columnconfigure(2, weight=1)
-    right.rowconfigure(9, weight=1)
+    right.rowconfigure(10, weight=1) # Adjusted row weight index
 
     ttk.Label(right, text="С кем общаемся:", style="Dark.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
     friend_combo = ttk.Combobox(right, width=50, state="readonly", style="Friend.TCombobox")
@@ -985,7 +1054,11 @@ def main():
 
     see_my_msgs_var = tk.BooleanVar(value=False)
     ttk.Checkbutton(right, text="Видеть мои сообщения", variable=see_my_msgs_var, style="Dark.TCheckbutton")\
-        .grid(row=2, column=0, columnspan=3, sticky="w", pady=(0,6))
+        .grid(row=2, column=0, columnspan=1, sticky="w", pady=(0,6))
+
+    verbose_logging_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(right, text="Подробные логи", variable=verbose_logging_var, style="Dark.TCheckbutton")\
+        .grid(row=2, column=1, columnspan=2, sticky="w", pady=(0,6))
 
     ttk.Label(right, text="Температура модели:", style="Dark.TLabel").grid(row=3, column=0, sticky="w")
     temp_var = tk.DoubleVar(value=0.7)
