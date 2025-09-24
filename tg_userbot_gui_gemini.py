@@ -681,6 +681,12 @@ def on_active_chat_select(_=None):
 
     friend_index = active_chat_entities.get(chat_name, {}).get("friend_index", 0)
     log_message(f"  [DEBUG] Found friend_index: {friend_index} for chat '{chat_name}'", level="debug")
+
+    # Bounds check to prevent IndexError if friends list has changed
+    if friend_index >= len(FRIENDS):
+        log_message(f"  [WARN] friend_index {friend_index} is out of bounds. Defaulting to 0.", level="warning")
+        friend_index = 0
+
     friend_combo.current(friend_index)
 
     friend_name = FRIENDS[friend_index][0]
