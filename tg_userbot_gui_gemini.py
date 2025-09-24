@@ -213,7 +213,6 @@ async def acquire_rate_slot(limit_per_min: int):
             _rate_window.popleft()
         if len(_rate_window) >= limit_per_min:
             wait = 60 - (now - _rate_window[0]) + 0.02
-            append_log_sync(f"[Rate Limit] Превышен лимит RPM ({limit_per_min}/min). Ожидаю {wait:.2f} сек...", "yellow")
             await asyncio.sleep(max(0.0, wait))
         _rate_window.append(time.time())
 
@@ -243,7 +242,6 @@ def load_history(chat_title: str, friend_name: str):
         except Exception:
             pass
 
-    # If file is old format (list) or doesn't exist, create a new structure
     history = [
         {"role": "system", "content": SYSTEM_PROMPT_TXT},
         {"role": "system", "content": f"Сейчас ты общаешься с: {friend_name}."}
@@ -265,9 +263,8 @@ def clear_log():
 def log_message(text: str, level: str = "info"):
     """
     Logs a message to the console.log file and optionally to the GUI.
-    Levels: 'info', 'error', 'debug', 'focus'.
+    Levels: 'info', 'error', 'debug', 'focus', 'warning', 'user'.
     """
-    # --- File Logging (always on) ---
     log_file_path = os.path.join(BASE_DIR, "console.log")
     try:
         with open(log_file_path, "a", encoding="utf-8") as f:
@@ -275,24 +272,17 @@ def log_message(text: str, level: str = "info"):
     except Exception as e:
         print(f"Failed to write to log file: {e}")
 
-    # --- GUI Logging ---
     if not root or not log_text:
         print(text)
         return
 
-    # Map level to color tag
     tag_map = {
-        "info": "green",
-        "error": "red",
-        "focus": "violet",
-        "debug": "grey",
-        "warning": "yellow",
-        "user": "white"
+        "info": "green", "error": "red", "focus": "violet", "debug": "grey",
+        "warning": "yellow", "user": "white"
     }
     tag = tag_map.get(level, "white")
 
     def _append_to_gui():
-        # Only show non-errors if verbose logging is on
         if level != 'error' and not (verbose_logging_var and verbose_logging_var.get()):
              return
         log_text.configure(state='normal')
@@ -352,8 +342,6 @@ async def transcribe_audio(media_buffer):
             smart_format=True
         )
 
-        # The SDK's transcribe_file is synchronous, so we run it in a separate thread
-        # to avoid blocking the asyncio event loop.
         response = await asyncio.to_thread(
             dg_client.listen.rest.v("1").transcribe_file, payload, options
         )
@@ -367,8 +355,6 @@ async def transcribe_audio(media_buffer):
 
 async def gemini_generate(history, friend_name: str, temperature: float, custom_prompt: str):
     endpoint, model, rpm = load_api_config()
-
-    # Combine main, custom, and friend prompts
     full_system_prompt = f"{SYSTEM_PROMPT_TXT}\n\n{custom_prompt}\n\nСейчас ты общаешься с: {friend_name}."
 
     payload = {
@@ -387,9 +373,7 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
     async with httpx.AsyncClient(timeout=90) as cli:
         await acquire_rate_slot(rpm)
         r = await cli.post(endpoint, headers=headers, json=payload)
-
         log_message(f"[API Response Raw] {r.text}", level="debug")
-
         if r.status_code >= 400:
             try:
                 js = r.json()
@@ -453,19 +437,24 @@ async def multi_chat_handler(evt):
         if getattr(evt.message, "sender_id", None) == me.id: return
 
     chat_id = evt.chat_id
-    # Find chat title and friend name from our active chats
     chat_title = active_chat_id_map.get(chat_id)
-    if not chat_title: return # Not a chat we are monitoring
+    if not chat_title: return
 
     chat_data = active_chat_entities.get(chat_title, {})
     friend_index = chat_data.get("friend_index", len(FRIENDS))
-    friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
 
+    # This is the fix for the IndexError
+    if friend_index >= len(FRIENDS):
+        friend_index = 0
+
+    friend_name = FRIENDS[friend_index][0]
     history, custom_prompt, hist_path = load_history(chat_title, friend_name)
+
     log_message(f"-> Msg in [{chat_title}]", level="info")
 
     entry = None
     is_voice = evt.message.voice
+    media = evt.media
 
     if is_voice:
         log_message(f"  [User] <голосовое сообщение>", level="user")
@@ -479,25 +468,22 @@ async def multi_chat_handler(evt):
         else:
             log_message(f"  [Transcription] Не удалось распознать речь.", level="error")
 
-    elif evt.media:
+    elif media:
         log_message(f"  [User] <media>", level="user")
-
-        # 1) Determine MIME type from Telegram
         mime = None
         try:
             if getattr(evt.message, "file", None) and getattr(evt.message.file, "mime_type", None):
                 mime = evt.message.file.mime_type
             elif getattr(evt, "photo", None) or getattr(evt.message, "photo", None):
-                mime = "image/jpeg"  # Telegram Photo objects are usually jpeg
+                mime = "image/jpeg"
         except Exception:
             pass
 
         buf = io.BytesIO()
-        await cli.download_media(evt.media, buf)
+        await cli.download_media(media, buf)
         data = buf.getvalue()
         buf.close()
 
-        # 2) If type is not supported, try to convert to PNG
         supported_mimes = {"image/png", "image/jpeg", "image/webp", "image/gif", "image/heic"}
         if mime not in supported_mimes:
             try:
@@ -509,16 +495,15 @@ async def multi_chat_handler(evt):
                 mime = "image/png"
             except Exception as e:
                 log_message(f"[Image Error] Failed to convert image: {e}", level="error")
-                return # Skip this message
+                return
 
-        # 3) Create the DATA URL with the correct mime type
         b64 = base64.b64encode(data).decode("ascii")
         entry = f"DATA:{mime};base64,{b64}"
 
     else:
         text = (evt.raw_text or "").strip()
-        log_message(f"  [User] {text}", level="user")
         if text:
+            log_message(f"  [User] {text}", level="user")
             entry = text
 
     if not entry:
@@ -530,8 +515,6 @@ async def multi_chat_handler(evt):
     async with SEM:
         try:
             reply = await gemini_generate(history, friend_name=friend_name, temperature=float(temp_var.get()), custom_prompt=custom_prompt)
-        except httpx.HTTPStatusError as he:
-            log_message(f"  [Gemini HTTP] {he}", level="error"); return
         except Exception as e:
             log_message(f"  [Gemini Error] {e}", level="error"); return
 
@@ -549,19 +532,10 @@ async def start_listeners():
         messagebox.showwarning("Ошибка", "Нет активных чатов для запуска.")
         return
 
-    try:
-        endpoint, model, rpm = load_api_config()
-    except Exception as e:
-        messagebox.showerror("api_text_model.json", str(e)); return
-
     cli = await ensure_client()
     me = await cli.get_me()
 
-    # Create a map of chat_id -> chat_title for the handler
-    active_chat_id_map = {
-        v["entity"].id: k for k, v in active_chat_entities.items()
-    }
-
+    active_chat_id_map = { v["entity"].id: k for k, v in active_chat_entities.items() }
     entities = [v["entity"] for v in active_chat_entities.values()]
 
     handler_ref = multi_chat_handler
@@ -570,7 +544,7 @@ async def start_listeners():
     bot_running = True
     clear_log()
     log_message(f"✅ Подключено как {me.first_name} (id={me.id})", level="focus")
-    log_message(f"🤖 Провайдер: gemini | Модель: {model}", level="info")
+    log_message(f"🤖 Провайдер: gemini | Модель: {load_api_config()[1]}", level="info")
     log_message(f"🚀 Мост запущен для {len(entities)} чатов. Жду сообщения.", level="info")
 
 async def stop_listeners():
@@ -635,12 +609,6 @@ def on_start():
 def on_stop():
     run_async(stop_listeners()); set_buttons(False)
 
-def on_restart():
-    run_async(stop_listeners())
-    refresh_dialogs_from_async(clear_selection=True)
-    chat_listbox.selection_clear(0, 'end')
-    set_buttons(False)
-
 def on_add_chat():
     selected_indices = chat_listbox.curselection()
     if not selected_indices:
@@ -653,7 +621,6 @@ def on_add_chat():
         chat_name, chat_entity = filtered_chats[i]
 
         if chat_name not in current_active_chats:
-            # Store entity and current friend context
             active_chat_entities[chat_name] = {
                 "entity": chat_entity,
                 "friend_index": selected_friend_index
@@ -665,38 +632,72 @@ def on_remove_chat():
     if not selected_indices:
         return
 
-    # Iterate backwards to avoid index shifting issues
     for i in sorted(selected_indices, reverse=True):
         chat_name = active_chats_listbox.get(i)
         active_chats_listbox.delete(i)
         if chat_name in active_chat_entities:
             del active_chat_entities[chat_name]
 
+def on_restart():
+    run_async(stop_listeners())
+    refresh_dialogs_from_async(clear_selection=True)
+    chat_listbox.selection_clear(0, 'end')
+    set_buttons(False)
+
 def on_active_chat_select(_=None):
     sel = active_chats_listbox.curselection()
     if not sel: return
     chat_name = active_chats_listbox.get(sel[0])
 
-    log_message(f"Фокус на чат: [{chat_name}].", level="info")
-
     friend_index = active_chat_entities.get(chat_name, {}).get("friend_index", 0)
-    log_message(f"  [DEBUG] Found friend_index: {friend_index} for chat '{chat_name}'", level="debug")
-
-    # Bounds check to prevent IndexError if friends list has changed
     if friend_index >= len(FRIENDS):
-        log_message(f"  [WARN] friend_index {friend_index} is out of bounds. Defaulting to 0.", level="warning")
         friend_index = 0
 
     friend_combo.current(friend_index)
-
     friend_name = FRIENDS[friend_index][0]
     _, custom_prompt, _ = load_history(chat_name, friend_name)
-    log_message(f"  [DEBUG] Loaded custom_prompt: '{custom_prompt[:50]}...'", level="debug")
 
     custom_prompt_text.configure(state='normal')
     custom_prompt_text.delete('1.0', 'end')
     custom_prompt_text.insert('1.0', custom_prompt)
     custom_prompt_text.configure(state='normal')
+
+def on_save_prompt():
+    sel = active_chats_listbox.curselection()
+    if not sel:
+        messagebox.showwarning("Ошибка", "Сначала выберите чат в списке активных."); return
+    chat_title = active_chats_listbox.get(sel[0])
+
+    prompt_content = custom_prompt_text.get("1.0", "end-1c").strip()
+
+    chat_data = active_chat_entities.get(chat_title, {})
+    friend_index = chat_data.get("friend_index", len(FRIENDS))
+    friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
+
+    history, _, path = load_history(chat_title, friend_name)
+    save_history(path, history, prompt_content)
+    log_message(f"✅ Промпт для '{chat_title}' сохранен.", level="info")
+
+def on_clear_history():
+    sel = active_chats_listbox.curselection()
+    if not sel:
+        messagebox.showwarning("Ошибка", "Выбери активный чат."); return
+
+    title = active_chats_listbox.get(sel[0])
+    if not messagebox.askyesno("Подтверждение", f"Вы уверены, что хотите полностью удалить историю для чата '{title}'? Это действие необратимо."):
+        return
+
+    history_file_path = _history_path(title)
+
+    try:
+        if os.path.exists(history_file_path):
+            os.remove(history_file_path)
+        on_active_chat_select()
+        clear_log()
+        log_message(f"[Info] Файл истории для '{title}' был удален.", level="info")
+    except Exception as e:
+        log_message(f"Не удалось удалить файл истории: {e}", level="error")
+        messagebox.showerror("Ошибка", f"Не удалось удалить файл истории: {e}")
 
 async def on_send_from_gui():
     sel = active_chats_listbox.curselection()
@@ -719,7 +720,6 @@ async def on_send_from_gui():
     friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
     history, custom_prompt, hist_path = load_history(chat_title, friend_name)
 
-    # Add our GUI message to history
     history.append({"role": "user", "content": text})
     save_history(hist_path, history, custom_prompt)
 
@@ -733,17 +733,10 @@ async def on_send_from_gui():
         log_message(f"<~ Ответ для [{chat_title}]: {reply}", level="warning")
         history.append({"role": "assistant", "content": reply})
         save_history(hist_path, history, custom_prompt)
-
-        # Clear the input box
         gui_message_text.delete('1.0', 'end')
-
-        # This function is for "private" interaction with the AI.
-        # We no longer send the message to the Telegram chat here.
-        # await cli.send_message(chat_entity, reply)
         log_message(f"   (переписка сохранена в историю)", level="info")
     else:
         log_message(f"[Send GUI Msg] Нет ответа от AI.", level="error")
-
 
 async def on_send_to_focused_chat():
     sel = active_chats_listbox.curselection()
@@ -778,54 +771,12 @@ async def on_send_to_focused_chat():
         log_message(f"<~ Ответ для [{chat_title}]: {reply}", level="warning")
         history.append({"role": "assistant", "content": reply})
         save_history(hist_path, history, custom_prompt)
-
         gui_message_text.delete('1.0', 'end')
-
         cli = await ensure_client()
         await cli.send_message(chat_entity, reply)
         log_message(f"   (сообщение отправлено в Telegram)", level="info")
     else:
         log_message(f"[Send TG Msg] Нет ответа от AI.", level="error")
-
-
-def on_save_prompt():
-    sel = active_chats_listbox.curselection()
-    if not sel:
-        messagebox.showwarning("Ошибка", "Сначала выберите чат в списке активных."); return
-    chat_title = active_chats_listbox.get(sel[0])
-
-    prompt_content = custom_prompt_text.get("1.0", "end-1c").strip()
-    log_message(f"Saving prompt for '{chat_title}'. Content: '{prompt_content[:50]}...'", level="debug")
-
-    # Get the correct friend context for this chat
-    chat_data = active_chat_entities.get(chat_title, {})
-    friend_index = chat_data.get("friend_index", len(FRIENDS))
-    friend_name = NONAME[0] if friend_index >= len(FRIENDS) else FRIENDS[friend_index][0]
-    log_message(f"  [DEBUG] Using friend_name '{friend_name}' for save.", level="debug")
-
-    history, _, path = load_history(chat_title, friend_name)
-    save_history(path, history, prompt_content)
-
-    log_message(f"✅ Промпт для '{chat_title}' сохранен.", level="info")
-
-def on_clear_history():
-    sel = active_chats_listbox.curselection()
-    if not sel:
-        messagebox.showwarning("Ошибка", "Выбери активный чат."); return
-    title = active_chats_listbox.get(sel[0])
-
-    idx = friend_combo.current()
-    friend_name = FRIENDS[idx][0] if idx < len(FRIENDS) else NONAME[0]
-    p = _history_path(title)
-    hist = [
-        {"role": "system", "content": SYSTEM_PROMPT_TXT},
-        {"role": "system", "content": f"Сейчас ты общаешься с: {friend_name}."}
-    ]
-    # Also clears the custom prompt
-    save_history(p, hist, "")
-    on_active_chat_select() # Refresh the text box
-    clear_log()
-    log_message("[Info] История и доп. промпт очищены.", level="info")
 
 def set_buttons(run):
     start_btn.configure(state='disabled' if run else 'normal')
@@ -837,27 +788,23 @@ def set_buttons(run):
 
 def save_gui_state():
     try:
-        # Check if GUI widgets have been initialized
         if not all([active_chats_listbox, temp_var, friend_combo, see_my_msgs_var]):
-            print("GUI not fully initialized, skipping state save.")
             return
 
-        # This now needs to store friend context for each chat
         active_chats_data = []
         for chat_name in active_chats_listbox.get(0, "end"):
-            friend_index = active_chat_entities[chat_name].get("friend_index", 0)
+            friend_index = active_chat_entities.get(chat_name, {}).get("friend_index", 0)
             active_chats_data.append({"name": chat_name, "friend_index": friend_index})
 
         state = {
             "active_chats": active_chats_data,
             "temperature": temp_var.get(),
-            "friend_index": friend_combo.current(), # Save last selected global friend
+            "friend_index": friend_combo.current(),
             "see_my_msgs": see_my_msgs_var.get()
         }
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        # Don't crash the app if saving state fails
         print(f"Failed to save GUI state: {e}")
 
 def load_gui_state():
@@ -879,11 +826,8 @@ def on_friend_change(_=None):
 
     if chat_name in active_chat_entities:
         active_chat_entities[chat_name]["friend_index"] = new_friend_index
-        log_message(f"Friend context updated for '{chat_name}'. New index: {new_friend_index}", level="debug")
-    log_message(f"Для чата [{chat_name}] установлен друг: {friend_combo.get()}", level="info")
 
 def restore_active_chats(active_chats_data):
-    """Helper to restore active chats after main dialog list is populated."""
     for chat_data in active_chats_data:
         name = chat_data.get("name")
         friend_index = chat_data.get("friend_index", 0)
@@ -898,7 +842,7 @@ def restore_active_chats(active_chats_data):
 
 def on_close():
     save_gui_state()
-    run_async(stop_listeners())
+    run_async(stop_bot())
     if aio_loop: aio_loop.call_soon_threadsafe(aio_loop.stop)
     root.destroy()
 
@@ -923,17 +867,9 @@ def style_combobox_dropdown(cb: ttk.Combobox, bg="#101010", fg="#ffffff",
     cb.after(300, _apply)
 
 def main():
-    # Delete old log file on startup
-    log_file_path = os.path.join(BASE_DIR, "console.log")
-    if os.path.exists(log_file_path):
-        try:
-            os.remove(log_file_path)
-        except OSError as e:
-            print(f"Error removing log file: {e}")
-
     global root, chat_listbox, chat_search, friend_combo, log_text
     global start_btn, stop_btn, restart_btn, clear_btn, status_label
-    global see_my_msgs_var, temp_var, temp_value_label, verbose_logging_var
+    global see_my_msgs_var, temp_var, temp_value_label
     global SYSTEM_PROMPT_TXT, FRIENDS, NONAME
 
     ensure_api_config()
@@ -1031,6 +967,7 @@ def main():
         selectmode="extended"
     )
     active_chats_listbox.grid(row=1, column=0, sticky="nsew", pady=(4,0))
+    active_chats_listbox.bind("<<ListboxSelect>>", on_active_chat_select)
 
     ttk.Label(active_chats_frame, text="Доп. промпт для чата:", style="Dark.TLabel").grid(row=2, column=0, sticky="w", pady=(8,0))
     custom_prompt_text = scrolledtext.ScrolledText(
@@ -1039,16 +976,14 @@ def main():
     )
     custom_prompt_text.grid(row=3, column=0, sticky="nsew", pady=4)
 
-    save_prompt_btn = ttk.Button(active_chats_frame, text="Сохранить промпт", command=lambda: on_save_prompt(), style="Dark.TButton")
+    save_prompt_btn = ttk.Button(active_chats_frame, text="Сохранить промпт", command=on_save_prompt, style="Dark.TButton")
     save_prompt_btn.grid(row=4, column=0, sticky="ew")
-
-    active_chats_listbox.bind("<<ListboxSelect>>", on_active_chat_select)
 
     # --- Правая колонка (Управление и лог) ---
     right = ttk.Frame(main_frame, style="Dark.TLabel")
     right.grid(row=0, column=3, sticky="nsew")
     right.columnconfigure(0, weight=1); right.columnconfigure(1, weight=1); right.columnconfigure(2, weight=1)
-    right.rowconfigure(10, weight=1) # Adjusted row weight index
+    right.rowconfigure(12, weight=1)
 
     ttk.Label(right, text="С кем общаемся:", style="Dark.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
     friend_combo = ttk.Combobox(right, width=50, state="readonly", style="Friend.TCombobox")
@@ -1095,7 +1030,6 @@ def main():
     send_to_tg_btn = ttk.Button(right, text="Отправить ответ в ЧАТ В ФОКУСЕ", command=lambda: run_async(on_send_to_focused_chat()), style="Dark.TButton")
     send_to_tg_btn.grid(row=9, column=0, columnspan=3, sticky="ew")
 
-
     status_label = ttk.Label(right, text="Состояние: Остановлен", style="Dark.TLabel", foreground="red")
     status_label.grid(row=10, column=0, columnspan=3, sticky="w", pady=(2,6))
 
@@ -1112,8 +1046,6 @@ def main():
 
     # Привязываем в глобальные
     globals().update(locals())
-    globals()["custom_prompt_text"] = custom_prompt_text
-    globals()["gui_message_text"] = gui_message_text
 
     # Фоновый event loop
     loop_thread = threading.Thread(target=start_background_loop, daemon=True)
@@ -1127,12 +1059,10 @@ def main():
         if not saved_state:
             return
 
-        # Restore simple widgets
         temp_var.set(saved_state.get("temperature", 0.7))
         friend_combo.current(saved_state.get("friend_index", 0))
         see_my_msgs_var.set(saved_state.get("see_my_msgs", False))
 
-        # Restore active chats list
         active_chats_to_restore = saved_state.get("active_chats", [])
         if active_chats_to_restore:
             restore_active_chats(active_chats_to_restore)

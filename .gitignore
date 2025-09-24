@@ -35,6 +35,10 @@ telegram_api.json
 api_text_model.json
 deepgram_api.json
 gui_state.json
+SYSTEM_PROMPT.json
+
+# Log files
+*.log
 
 # IDE and cache files
 __pycache__/
@@ -45,6 +49,3 @@ __pycache__/
 dist/
 build/
 *.spec
-
-# Logs
-*.log
