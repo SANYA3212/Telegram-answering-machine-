@@ -158,7 +158,15 @@ def load_prompt_config():
     ensure_prompt_config()
     with open(PROMPT_FILE, "r", encoding="utf-8") as f:
         js = json.load(f)
-    system_prompt = str(js.get("system_prompt") or _default_system_prompt())
+
+    system_prompt = js.get("system_prompt")
+    if not system_prompt or not isinstance(system_prompt, str):
+        log_message(
+            "Ключ 'system_prompt' не найден или пуст в SYSTEM_PROMPT.json. Используется промпт по умолчанию.",
+            level="error"
+        )
+        system_prompt = _default_system_prompt()
+
     friends_items = js.get("friends")
     if not isinstance(friends_items, list) or not friends_items:
         friends_items = _default_friends()
@@ -242,10 +250,9 @@ def load_history(chat_title: str, friend_name: str):
         except Exception:
             pass
 
-    history = [
-        {"role": "system", "content": SYSTEM_PROMPT_TXT},
-        {"role": "system", "content": f"Сейчас ты общаешься с: {friend_name}."}
-    ]
+    # If file doesn't exist, create an empty history.
+    # The system prompt is now passed separately to the API.
+    history = []
     save_history(p, history, custom_prompt)
     return history, custom_prompt, p
 
