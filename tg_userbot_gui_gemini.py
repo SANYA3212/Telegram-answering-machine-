@@ -17,6 +17,7 @@ import sys  # <<<<< добавлено
 import httpx
 from telethon import TelegramClient, events
 
+import scheduler
 # ===================== Папки/файлы =====================
 # onefile-режим PyInstaller: писать рядом с .exe
 try:
@@ -161,6 +162,7 @@ aio_loop_ready = threading.Event()
 client = None
 bot_running = False
 handler_ref = None
+scheduler_task = None
 
 root = None
 chat_listbox = None
@@ -303,6 +305,46 @@ async def gemini_generate(history, friend_name: str, temperature: float):
                 out.append(p["text"])
         return "\n".join(out).strip()
 
+async def gemini_parse_task(text: str):
+    """Использует Gemini для извлечения данных задачи из текста."""
+    endpoint, model, rpm = load_api_config()
+    prompt = (
+        "Ты — ИИ-парсер для планировщика задач. Твоя задача — извлечь из текста три параметра: "
+        "кому адресована задача (addressee), что нужно сделать (text) и через сколько минут (minutes). "
+        "Если адресат не указан, используй 'мне'. Если время не указано, верни 0. "
+        "Ответ должен быть ТОЛЬКО в формате JSON. Пример: "
+        '{"addressee": "Петя", "text": "подойти к компьютеру", "minutes": 15}'
+    )
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": prompt}]},
+            {"role": "model", "parts": [{"text": "OK"}]},
+            {"role": "user", "parts": [{"text": text}]}
+        ],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 200}
+    }
+    headers = {"Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=30) as cli:
+        await acquire_rate_slot(rpm)
+        r = await cli.post(endpoint, headers=headers, json=payload)
+        r.raise_for_status()
+        js = r.json()
+        cand = (js.get("candidates") or [])
+        if not cand: return None
+        content = cand[0].get("content") or {}
+        parts = content.get("parts") or []
+        if not parts or "text" not in parts[0]: return None
+
+        # Извлекаем JSON из ответа, даже если он в тройных кавычках
+        raw_text = parts[0]["text"]
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if not match: return None
+
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
 # ===================== Async event loop =====================
 def start_background_loop():
     global aio_loop
@@ -338,7 +380,7 @@ async def get_dialogs():
         return []
 
 async def start_bot(chat_entity, friend_name, chat_title):
-    global handler_ref, bot_running
+    global handler_ref, bot_running, scheduler_task
     try:
         endpoint, model, rpm = load_api_config()
     except Exception as e:
@@ -348,6 +390,13 @@ async def start_bot(chat_entity, friend_name, chat_title):
     me = await cli.get_me()
     my_id = me.id
     bot_running = True
+
+    # Запускаем планировщик
+    global scheduler_task
+    if scheduler_task and not scheduler_task.done():
+        scheduler_task.cancel()
+    scheduler.init_db()
+    scheduler_task = asyncio.create_task(scheduler.scheduler_loop(cli, append_log_sync))
 
     history, hist_path = load_history(chat_title, friend_name)
 
@@ -370,6 +419,33 @@ async def start_bot(chat_entity, friend_name, chat_title):
         text = (evt.raw_text or "").strip()
         media = evt.media
         append_log_sync(f"[User] {'<media>' if media else text}", "white")
+
+        # Проверяем, не является ли это командой для планировщика
+        if text and any(keyword in text.lower() for keyword in ["напомни", "напиши через", "запланируй"]):
+            append_log_sync(f"🔎 Обнаружен запрос на задачу. Парсинг...", "yellow")
+            task_data = await gemini_parse_task(text)
+            if task_data and task_data.get("minutes"):
+                try:
+                    addressee = task_data.get("addressee", "мне")
+                    task_text = task_data.get("text", "")
+                    minutes = int(task_data.get("minutes", 0))
+
+                    if not task_text or minutes <= 0:
+                        raise ValueError("Некорректные данные от Gemini.")
+
+                    execution_time = int(time.time()) + minutes * 60
+                    chat_id = evt.chat_id
+
+                    scheduler.add_task(chat_id, addressee, task_text, execution_time)
+
+                    confirmation_msg = f"✅ Ок, напомню '{addressee}': '{task_text}' через {minutes} мин."
+                    await cli.send_message(chat_entity, confirmation_msg)
+                    append_log_sync(confirmation_msg, "green")
+                    return # Прерываем, чтобы не генерировать обычный ответ
+                except Exception as e:
+                    append_log_sync(f"❗️ Ошибка обработки задачи: {e}", "red")
+            else:
+                append_log_sync(f"⚠️ Не удалось распарсить задачу.", "yellow")
 
         if media:
             buf = io.BytesIO()
@@ -404,7 +480,7 @@ async def start_bot(chat_entity, friend_name, chat_title):
     append_log_sync("🚀 Мост запущен — жду сообщения.", "green")
 
 async def stop_bot():
-    global handler_ref, bot_running
+    global handler_ref, bot_running, scheduler_task
     bot_running = False
     if client and handler_ref:
         try:
@@ -412,6 +488,9 @@ async def stop_bot():
         except Exception:
             pass
     handler_ref = None
+    if scheduler_task and not scheduler_task.done():
+        scheduler_task.cancel()
+        scheduler_task = None
     append_log_sync("⛔ Бот остановлен.", "red")
 
 # ===================== GUI =====================
@@ -635,6 +714,7 @@ def main():
     log_text.tag_config("green",  foreground="lightgreen")
     log_text.tag_config("red",    foreground="red")
     log_text.tag_config("white",  foreground="white")
+    log_text.tag_config("yellow", foreground="yellow")
     log_text.grid(row=8, column=0, columnspan=3, sticky="nsew")
 
     # Привязываем в глобальные
