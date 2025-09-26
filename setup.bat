@@ -6,5 +6,5 @@ call .venv\Scripts\activate
 echo Upgrading pip...
 python -m pip install --upgrade pip
 echo Installing dependencies...
-pip install httpx telethon "httpx[socks]" cryptg pillow
+pip install telethon httpx "httpx[socks]" deepgram-sdk Pillow cryptg
 pause

@@ -36,6 +36,7 @@ def get_due_tasks():
     """Возвращает задачи, время выполнения которых наступило."""
     current_time = int(time.time())
     with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id, chat_id, addressee_name, task_text FROM tasks WHERE execution_time <= ? AND status = 'ожидает'",
@@ -54,22 +55,22 @@ async def scheduler_loop(client, log_callback):
     """
     Основной цикл планировщика. Проверяет наличие задач и отправляет уведомления.
     """
-    log_callback("⚙️ Планировщик запущен и готов к работе.", "green")
+    log_callback("⚙️ Планировщик запущен и готов к работе.", level="info")
     while True:
         try:
             due_tasks = get_due_tasks()
-            for task_id, chat_id, addressee_name, task_text in due_tasks:
+            for task in due_tasks:
+                task_id = task["id"]
                 try:
-                    message = f"Напоминание для {addressee_name}: {task_text}"
-                    await client.send_message(chat_id, message)
+                    message = f"Напоминание для {task['addressee_name']}: {task['task_text']}"
+                    await client.send_message(task['chat_id'], message)
                     mark_task_completed(task_id)
-                    log_callback(f"✅ Напоминание отправлено: {addressee_name} -> '{task_text}'", "green")
+                    log_callback(f"✅ Напоминание отправлено: {task['addressee_name']} -> '{task['task_text']}'", level="info")
                 except Exception as e:
-                    log_callback(f"❌ Ошибка отправки напоминания (ID: {task_id}): {e}", "red")
-                    # Возможно, стоит добавить логику повторной попытки или пометить как ошибку
-                    mark_task_completed(task_id) # Помечаем как выполненную, чтобы не спамить
+                    log_callback(f"❌ Ошибка отправки напоминания (ID: {task_id}): {e}", level="error")
+                    mark_task_completed(task_id)
 
-            await asyncio.sleep(15)  # Проверять каждые 15 секунд
+            await asyncio.sleep(15)
         except Exception as e:
-            log_callback(f"❗️ Критическая ошибка в цикле планировщика: {e}", "red")
-            await asyncio.sleep(60) # В случае серьезной ошибки, ждем дольше
+            log_callback(f"❗️ Критическая ошибка в цикле планировщика: {e}", level="error")
+            await asyncio.sleep(60)
