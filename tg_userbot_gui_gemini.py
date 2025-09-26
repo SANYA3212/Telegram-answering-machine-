@@ -93,7 +93,7 @@ def load_api_config():
     if not model:
         raise RuntimeError("В api_text_model.json не указана model (например, gemini-1.5-flash).")
 
-    endpoint = f"{base_url}/v1beta/models/{model}:generateContent?key={api_key}"
+    endpoint = f"{base_url}/v1/models/{model}:generateContent?key={api_key}"
     return endpoint, model, rpm
 
 def load_tg_config():
