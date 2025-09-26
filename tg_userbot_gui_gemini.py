@@ -354,12 +354,12 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
     full_system_prompt = f"{SYSTEM_PROMPT_TXT}\n\n{custom_prompt}\n\nСейчас ты общаешься с: {friend_name}."
 
     payload = {
-        "system_instruction": {
+        "systemInstruction": {
             "role": "system",
             "parts": [{"text": full_system_prompt}]
         },
         "contents": _history_to_gemini_contents(history),
-        "generation_config": {
+        "generationConfig": {
             "temperature": float(temperature),
             "top_p": 0.95,
             "max_output_tokens": 1024
@@ -388,6 +388,7 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
                 out.append(p["text"])
         return "\n".join(out).strip()
 
+
 async def gemini_parse_task(text: str):
     """Использует Gemini для извлечения данных задачи из текста."""
     endpoint, model, rpm = load_api_config()
@@ -404,7 +405,7 @@ async def gemini_parse_task(text: str):
             {"role": "model", "parts": [{"text": "OK"}]},
             {"role": "user", "parts": [{"text": text}]}
         ],
-        "generation_config": {"temperature": 0.0, "max_output_tokens": 200}
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 200}
     }
     headers = {"Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30) as cli:
@@ -543,11 +544,12 @@ async def multi_chat_handler(evt):
     if not entry:
         return
 
+    # Проверяем, не является ли это командой для планировщика
     if isinstance(entry, str) and any(keyword in entry.lower() for keyword in ["напомни", "напиши через", "запланируй"]):
         log_message(f"🔎 Обнаружен запрос на задачу в чате '{chat_title}'. Парсинг...", level="warning")
-        task_data = await gemini_parse_task(entry)
-        if task_data and task_data.get("minutes"):
-            try:
+        try:
+            task_data = await gemini_parse_task(entry)
+            if task_data and task_data.get("minutes"):
                 addressee = task_data.get("addressee", "мне")
                 task_text = task_data.get("text", "")
                 minutes = int(task_data.get("minutes", 0))
@@ -563,10 +565,10 @@ async def multi_chat_handler(evt):
                 await cli.send_message(chat_id, confirmation_msg)
                 log_message(f"  [Scheduler] {confirmation_msg}", level="info")
                 return
-            except Exception as e:
-                log_message(f"❗️ Ошибка обработки задачи: {e}", level="error")
-        else:
-            log_message(f"⚠️ Не удалось распарсить задачу, обрабатываю как обычное сообщение.", level="warning")
+            else:
+                log_message(f"⚠️ Не удалось распарсить задачу, обрабатываю как обычное сообщение.", level="warning")
+        except Exception as e:
+            log_message(f"❗️ Ошибка обработки задачи: {e}", level="error")
 
     history.append({"role": "user", "content": entry})
     save_history(hist_path, history, custom_prompt)
@@ -574,8 +576,12 @@ async def multi_chat_handler(evt):
     async with SEM:
         try:
             reply = await gemini_generate(history, friend_name=friend_name, temperature=float(temp_var.get()), custom_prompt=custom_prompt)
+        except httpx.HTTPStatusError as http_err:
+            log_message(f"  [Gemini API Error] HTTP Status {http_err.response.status_code}. Проверьте ваш API-ключ или имя модели.", level="error")
+            return
         except Exception as e:
-            log_message(f"  [Gemini Error] {e}", level="error"); return
+            log_message(f"  [Gemini Error] Произошла непредвиденная ошибка: {e}", level="error")
+            return
 
     if reply:
         log_message(f"  [Sanya] {reply}", level="focus")
@@ -597,7 +603,6 @@ async def start_listeners():
         scheduler_task.cancel()
     scheduler.init_db()
     scheduler_task = asyncio.create_task(scheduler.scheduler_loop(cli, log_message))
-
     me = await cli.get_me()
 
     active_chat_id_map = { v["entity"].id: k for k, v in active_chat_entities.items() }
@@ -792,8 +797,11 @@ async def on_send_from_gui():
 
     try:
         reply = await gemini_generate(history, friend_name, float(temp_var.get()), custom_prompt)
+    except httpx.HTTPStatusError as http_err:
+        log_message(f"[Send GUI Msg Error] HTTP Status {http_err.response.status_code}. Проверьте ваш API-ключ или имя модели.", level="error")
+        return
     except Exception as e:
-        log_message(f"[Send GUI Msg Error] {e}", level="error")
+        log_message(f"[Send GUI Msg Error] Произошла непредвиденная ошибка: {e}", level="error")
         return
 
     if reply:
@@ -830,8 +838,11 @@ async def on_send_to_focused_chat():
 
     try:
         reply = await gemini_generate(history, friend_name, float(temp_var.get()), custom_prompt)
+    except httpx.HTTPStatusError as http_err:
+        log_message(f"[Send TG Msg Error] HTTP Status {http_err.response.status_code}. Проверьте ваш API-ключ или имя модели.", level="error")
+        return
     except Exception as e:
-        log_message(f"[Send TG Msg Error] {e}", level="error")
+        log_message(f"[Send TG Msg Error] Произошла непредвиденная ошибка: {e}", level="error")
         return
 
     if reply:
