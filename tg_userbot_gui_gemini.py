@@ -76,6 +76,18 @@ def ensure_tg_config():
             f, ensure_ascii=False, indent=2
         )
 
+def _normalize_gemini_model_name(model: str) -> str:
+    """Возвращает имя модели без префиксов вроде `models/` и суффиксов `:generateContent`."""
+    name = (model or "").strip()
+    if not name:
+        return ""
+    if name.startswith("models/"):
+        name = name.split("/", 1)[1]
+    if name.endswith(":generateContent"):
+        name = name[: -len(":generateContent")]
+    return name.strip()
+
+
 def load_api_config():
     ensure_api_config()
     with open(API_FILE, "r", encoding="utf-8") as f:
@@ -83,7 +95,7 @@ def load_api_config():
     provider = (cfg.get("provider") or "gemini").strip().lower()
     base_url = (cfg.get("base_url") or "").strip()
     api_key  = (cfg.get("api_key") or "").strip()
-    model    = (cfg.get("model") or "").strip()
+    model    = _normalize_gemini_model_name(cfg.get("model"))
     rpm      = int(cfg.get("rpm_limit") or 45)
 
     if provider != "gemini":
@@ -92,6 +104,9 @@ def load_api_config():
         raise RuntimeError("В api_text_model.json пустой api_key (Google API Key).")
     if not model:
         raise RuntimeError("В api_text_model.json не указана model (например, gemini-1.5-flash).")
+
+    if not base_url:
+        base_url = "https://generativelanguage.googleapis.com"
 
     base_url = base_url.rstrip("/")
     # Пользователи иногда добавляют в base_url сегменты /v1 или /v1beta. Эти части нужно
