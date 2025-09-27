@@ -93,7 +93,10 @@ def load_api_config():
     if not model:
         raise RuntimeError("В api_text_model.json не указана model (например, gemini-1.5-flash).")
 
-    endpoint = f"{base_url}/v1/models/{model}:generateContent?key={api_key}"
+    # Gemini "latest" models (и другие свежие версии) сейчас доступны только через v1beta.
+    # Если пользоваться путём /v1/..., то Google возвращает 404 ("model ... is not found for API
+    # version v1") — именно эту ошибку видели пользователи. Поэтому всегда вызываем v1beta.
+    endpoint = f"{base_url}/v1beta/models/{model}:generateContent?key={api_key}"
     return endpoint, model, rpm
 
 def load_tg_config():
@@ -362,8 +365,8 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
         "contents": contents,
         "generationConfig": {
             "temperature": float(temperature),
-            "top_p": 0.95,
-            "max_output_tokens": 1024
+            "topP": 0.95,
+            "maxOutputTokens": 1024
         }
     }
     headers = {"Content-Type": "application/json"}
