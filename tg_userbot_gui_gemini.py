@@ -76,14 +76,26 @@ def ensure_tg_config():
             f, ensure_ascii=False, indent=2
         )
 
+def _normalize_gemini_model_name(model: str) -> str:
+    """Возвращает имя модели без префиксов вроде `models/` и суффиксов `:generateContent`."""
+    name = (model or "").strip()
+    if not name:
+        return ""
+    if name.startswith("models/"):
+        name = name.split("/", 1)[1]
+    if name.endswith(":generateContent"):
+        name = name[: -len(":generateContent")]
+    return name.strip()
+
+
 def load_api_config():
     ensure_api_config()
     with open(API_FILE, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     provider = (cfg.get("provider") or "gemini").strip().lower()
-    base_url = (cfg.get("base_url") or "").strip().rstrip("/")
+    base_url = (cfg.get("base_url") or "").strip()
     api_key  = (cfg.get("api_key") or "").strip()
-    model    = (cfg.get("model") or "").strip()
+    model    = _normalize_gemini_model_name(cfg.get("model"))
     rpm      = int(cfg.get("rpm_limit") or 45)
 
     if provider != "gemini":
@@ -93,7 +105,23 @@ def load_api_config():
     if not model:
         raise RuntimeError("В api_text_model.json не указана model (например, gemini-1.5-flash).")
 
-    endpoint = f"{base_url}/v1/models/{model}:generateContent?key={api_key}"
+    if not base_url:
+        base_url = "https://generativelanguage.googleapis.com"
+
+    base_url = base_url.rstrip("/")
+    # Пользователи иногда добавляют в base_url сегменты /v1 или /v1beta. Эти части нужно
+    # убрать, иначе итоговый путь получится неверным и Google вернёт 404.
+    for suffix in ("/v1beta/models", "/v1beta", "/v1/models", "/v1"):
+        if base_url.endswith(suffix):
+            base_url = base_url[: -len(suffix)].rstrip("/")
+
+    if not base_url:
+        raise RuntimeError("Поле base_url в api_text_model.json не должно быть пустым.")
+
+    # Gemini "latest" models (и другие свежие версии) сейчас доступны только через v1beta.
+    # Если пользоваться путём /v1/..., то Google возвращает 404 ("model ... is not found for API
+    # version v1") — именно эту ошибку видели пользователи. Поэтому всегда вызываем v1beta.
+    endpoint = f"{base_url}/v1beta/models/{model}:generateContent?key={api_key}"
     return endpoint, model, rpm
 
 def load_tg_config():
@@ -325,6 +353,18 @@ def _history_to_gemini_contents(history):
         contents.append({"role": role_map, "parts": parts})
     return contents
 
+
+def _gemini_safety_settings(block_level="BLOCK_NONE"):
+    """Формирует настройки безопасного режима Gemini с единым порогом."""
+    categories = [
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "HARM_CATEGORY_CIVIC_INTEGRITY",
+    ]
+    return [{"category": cat, "threshold": block_level} for cat in categories]
+
 async def transcribe_audio(media_buffer):
     try:
         api_key = load_deepgram_config()
@@ -354,17 +394,20 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
     endpoint, model, rpm = load_api_config()
     full_system_prompt = f"{SYSTEM_PROMPT_TXT}\n\n{custom_prompt}\n\nСейчас ты общаешься с: {friend_name}."
 
-    # Per the v1 API, the system prompt is part of the contents
-    contents = [{"role": "system", "parts": [{"text": full_system_prompt}]}]
-    contents.extend(_history_to_gemini_contents(history))
+    contents = _history_to_gemini_contents(history)
 
     payload = {
+        "systemInstruction": {
+            "role": "system",
+            "parts": [{"text": full_system_prompt}]
+        },
         "contents": contents,
         "generationConfig": {
             "temperature": float(temperature),
-            "top_p": 0.95,
-            "max_output_tokens": 1024
-        }
+            "topP": 0.95,
+            "maxOutputTokens": 1024
+        },
+        "safetySettings": _gemini_safety_settings()
     }
     headers = {"Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=90) as cli:
@@ -378,6 +421,11 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
             except Exception:
                 r.raise_for_status()
         js = r.json()
+        feedback = js.get("promptFeedback") or {}
+        if feedback.get("blockReason"):
+            reason = feedback.get("blockReason")
+            log_message(f"[Gemini Safety Blocked] {reason}", level="error")
+            return ""
         cand = (js.get("candidates") or [])
         if not cand:
             return ""
@@ -406,7 +454,8 @@ async def gemini_parse_task(text: str):
             {"role": "model", "parts": [{"text": "OK"}]},
             {"role": "user", "parts": [{"text": text}]}
         ],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 200}
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 200},
+        "safetySettings": _gemini_safety_settings("BLOCK_ONLY_HIGH")
     }
     headers = {"Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30) as cli:
@@ -414,6 +463,10 @@ async def gemini_parse_task(text: str):
         r = await cli.post(endpoint, headers=headers, json=payload)
         r.raise_for_status()
         js = r.json()
+        feedback = js.get("promptFeedback") or {}
+        if feedback.get("blockReason"):
+            log_message(f"[Gemini Safety Blocked] {feedback.get('blockReason')}", level="error")
+            return None
         cand = (js.get("candidates") or [])
         if not cand: return None
         content = cand[0].get("content") or {}
