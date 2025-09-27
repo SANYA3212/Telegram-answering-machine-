@@ -359,8 +359,9 @@ def _gemini_safety_settings(block_level="BLOCK_NONE"):
     categories = [
         "HARM_CATEGORY_HARASSMENT",
         "HARM_CATEGORY_HATE_SPEECH",
-        "HARM_CATEGORY_SEXUAL",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
         "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "HARM_CATEGORY_CIVIC_INTEGRITY",
     ]
     return [{"category": cat, "threshold": block_level} for cat in categories]
 
