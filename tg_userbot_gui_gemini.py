@@ -353,6 +353,18 @@ def _history_to_gemini_contents(history):
         contents.append({"role": role_map, "parts": parts})
     return contents
 
+
+def _gemini_safety_settings(block_level="BLOCK_NONE"):
+    """Формирует настройки безопасного режима Gemini с единым порогом."""
+    categories = [
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUAL",
+        "HARM_CATEGORY_SELF_HARM",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+    ]
+    return [{"category": cat, "threshold": block_level} for cat in categories]
+
 async def transcribe_audio(media_buffer):
     try:
         api_key = load_deepgram_config()
@@ -394,7 +406,8 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
             "temperature": float(temperature),
             "topP": 0.95,
             "maxOutputTokens": 1024
-        }
+        },
+        "safetySettings": _gemini_safety_settings()
     }
     headers = {"Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=90) as cli:
@@ -408,6 +421,11 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
             except Exception:
                 r.raise_for_status()
         js = r.json()
+        feedback = js.get("promptFeedback") or {}
+        if feedback.get("blockReason"):
+            reason = feedback.get("blockReason")
+            log_message(f"[Gemini Safety Blocked] {reason}", level="error")
+            return ""
         cand = (js.get("candidates") or [])
         if not cand:
             return ""
@@ -436,7 +454,8 @@ async def gemini_parse_task(text: str):
             {"role": "model", "parts": [{"text": "OK"}]},
             {"role": "user", "parts": [{"text": text}]}
         ],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 200}
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 200},
+        "safetySettings": _gemini_safety_settings("BLOCK_ONLY_HIGH")
     }
     headers = {"Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30) as cli:
@@ -444,6 +463,10 @@ async def gemini_parse_task(text: str):
         r = await cli.post(endpoint, headers=headers, json=payload)
         r.raise_for_status()
         js = r.json()
+        feedback = js.get("promptFeedback") or {}
+        if feedback.get("blockReason"):
+            log_message(f"[Gemini Safety Blocked] {feedback.get('blockReason')}", level="error")
+            return None
         cand = (js.get("candidates") or [])
         if not cand: return None
         content = cand[0].get("content") or {}
