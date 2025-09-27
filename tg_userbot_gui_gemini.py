@@ -357,11 +357,13 @@ async def gemini_generate(history, friend_name: str, temperature: float, custom_
     endpoint, model, rpm = load_api_config()
     full_system_prompt = f"{SYSTEM_PROMPT_TXT}\n\n{custom_prompt}\n\nСейчас ты общаешься с: {friend_name}."
 
-    # Per the v1 API, the system prompt is part of the contents
-    contents = [{"role": "system", "parts": [{"text": full_system_prompt}]}]
-    contents.extend(_history_to_gemini_contents(history))
+    contents = _history_to_gemini_contents(history)
 
     payload = {
+        "systemInstruction": {
+            "role": "system",
+            "parts": [{"text": full_system_prompt}]
+        },
         "contents": contents,
         "generationConfig": {
             "temperature": float(temperature),
