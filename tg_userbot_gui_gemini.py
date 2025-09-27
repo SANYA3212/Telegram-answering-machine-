@@ -81,7 +81,7 @@ def load_api_config():
     with open(API_FILE, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     provider = (cfg.get("provider") or "gemini").strip().lower()
-    base_url = (cfg.get("base_url") or "").strip().rstrip("/")
+    base_url = (cfg.get("base_url") or "").strip()
     api_key  = (cfg.get("api_key") or "").strip()
     model    = (cfg.get("model") or "").strip()
     rpm      = int(cfg.get("rpm_limit") or 45)
@@ -92,6 +92,16 @@ def load_api_config():
         raise RuntimeError("В api_text_model.json пустой api_key (Google API Key).")
     if not model:
         raise RuntimeError("В api_text_model.json не указана model (например, gemini-1.5-flash).")
+
+    base_url = base_url.rstrip("/")
+    # Пользователи иногда добавляют в base_url сегменты /v1 или /v1beta. Эти части нужно
+    # убрать, иначе итоговый путь получится неверным и Google вернёт 404.
+    for suffix in ("/v1beta/models", "/v1beta", "/v1/models", "/v1"):
+        if base_url.endswith(suffix):
+            base_url = base_url[: -len(suffix)].rstrip("/")
+
+    if not base_url:
+        raise RuntimeError("Поле base_url в api_text_model.json не должно быть пустым.")
 
     # Gemini "latest" models (и другие свежие версии) сейчас доступны только через v1beta.
     # Если пользоваться путём /v1/..., то Google возвращает 404 ("model ... is not found for API
